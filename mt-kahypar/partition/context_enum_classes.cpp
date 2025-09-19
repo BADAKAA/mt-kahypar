@@ -57,6 +57,7 @@ namespace mt_kahypar {
     switch (type) {
       case InstanceType::graph: return os << "graph";
       case InstanceType::hypergraph: return os << "hypergraph";
+      case InstanceType::compressed_hypergraph: return os << "compressed hypergraph";
       case InstanceType::UNDEFINED: return os << "UNDEFINED";
         // omit default case to trigger compiler warning for missing cases
     }

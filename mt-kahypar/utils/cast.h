@@ -44,6 +44,7 @@ std::string typeToString(const mt_kahypar_hypergraph_type_t type) {
     case STATIC_HYPERGRAPH: return "STATIC_HYPERGRAPH";
     case DYNAMIC_HYPERGRAPH: return "DYNAMIC_HYPERGRAPH";
     case NULLPTR_HYPERGRAPH: return "NULLPTR_HYPERGRAPH";
+    case COMPRESSED_HYPERGRAPH: return "COMPRESSED_HYPERGRAPH";
   }
   return "UNDEFINED";
 }

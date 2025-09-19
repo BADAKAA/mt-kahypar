@@ -54,6 +54,16 @@ mt_kahypar_hypergraph_type_t to_hypergraph_c_type(const PresetType preset,
       case PresetType::UNDEFINED: throw InvalidParameterException("Unknown preset type!");
     }
   }
+  else if ( instance == InstanceType::compressed_hypergraph ) {
+    switch ( preset ) {
+      case PresetType::deterministic:
+      case PresetType::large_k:
+      case PresetType::default_preset:
+      case PresetType::quality: return COMPRESSED_HYPERGRAPH;
+      case PresetType::highest_quality: return DYNAMIC_HYPERGRAPH;
+      case PresetType::UNDEFINED: throw InvalidParameterException("Unknown preset type!");
+    }
+  }
   else {
     throw InvalidParameterException("Unknown instance type. Should be either graph or hypergraph");
   }

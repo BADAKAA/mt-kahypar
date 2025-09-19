@@ -182,6 +182,8 @@ InstanceType get_instance_type(mt_kahypar_hypergraph_t hypergraph) {
     case STATIC_HYPERGRAPH:
     case DYNAMIC_HYPERGRAPH:
       return InstanceType::hypergraph;
+    case COMPRESSED_HYPERGRAPH:
+      return InstanceType::compressed_hypergraph;
     case NULLPTR_HYPERGRAPH:
       return InstanceType::UNDEFINED;
   }
@@ -228,6 +230,10 @@ std::string incompatibility_description(mt_kahypar_hypergraph_t hypergraph) {
          << "HIGHEST_QUALITY"; break;
     case STATIC_HYPERGRAPH:
       ss << "The hypergraph uses the static hypergraph data structure which can be only used "
+         << "in combination with the following presets: "
+         << "DEFAULT, QUALITY, DETERMINISTIC and LARGE_K"; break;
+      case COMPRESSED_HYPERGRAPH:
+      ss << "The hypergraph uses a compressed representation the static hypergraph data structure which can be only used "
          << "in combination with the following presets: "
          << "DEFAULT, QUALITY, DETERMINISTIC and LARGE_K"; break;
     case DYNAMIC_HYPERGRAPH:

@@ -42,6 +42,7 @@
 #include "mt-kahypar/datastructures/dynamic_hypergraph_factory.h"
 #include "mt-kahypar/datastructures/static_hypergraph.h"
 #include "mt-kahypar/datastructures/static_hypergraph_factory.h"
+#include "mt-kahypar/datastructures/compressed_hypergraph.h"
 #include "mt-kahypar/datastructures/partitioned_hypergraph.h"
 #include "mt-kahypar/datastructures/delta_partitioned_hypergraph.h"
 
@@ -52,6 +53,7 @@ using DynamicPartitionedGraph = ds::PartitionedGraph<ds::DynamicGraph>;
 using StaticPartitionedHypergraph = ds::PartitionedHypergraph<ds::StaticHypergraph, ds::ConnectivityInfo>;
 using DynamicPartitionedHypergraph = ds::PartitionedHypergraph<ds::DynamicHypergraph, ds::ConnectivityInfo>;
 using StaticSparsePartitionedHypergraph = ds::PartitionedHypergraph<ds::StaticHypergraph, ds::SparseConnectivityInfo>;
+using CompressedPartitionedHypergraph = ds::PartitionedHypergraph<ds::CompressedHypergraph, ds::SparseConnectivityInfo>;
 
 struct StaticGraphTypeTraits : public kahypar::meta::PolicyBase {
   using Hypergraph = ds::StaticGraph;
@@ -62,6 +64,13 @@ struct DynamicGraphTypeTraits : public kahypar::meta::PolicyBase {
   using Hypergraph = ds::DynamicGraph;
   using PartitionedHypergraph = DynamicPartitionedGraph;
 };
+
+
+struct CompressedHypergraphTypeTraits : public kahypar::meta::PolicyBase {
+  using Hypergraph = ds::CompressedHypergraph;
+  using PartitionedHypergraph = StaticPartitionedHypergraph;
+};
+
 
 struct StaticHypergraphTypeTraits : public kahypar::meta::PolicyBase {
   using Hypergraph = ds::StaticHypergraph;

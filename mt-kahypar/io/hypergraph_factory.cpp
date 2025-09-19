@@ -29,6 +29,7 @@
 #include "mt-kahypar/macros.h"
 #include "mt-kahypar/definitions.h"
 #include "mt-kahypar/io/hypergraph_io.h"
+#include "mt-kahypar/io/compressed_hypergraph_io.h"
 #include "mt-kahypar/datastructures/fixed_vertex_support.h"
 #include "mt-kahypar/partition/conversion.h"
 #include "mt-kahypar/utils/exception.h"
@@ -54,10 +55,13 @@ mt_kahypar_hypergraph_t constructHypergraph(const HypernodeID& num_hypernodes,
     reinterpret_cast<mt_kahypar_hypergraph_s*>(hypergraph), Hypergraph::TYPE };
 }
 
+
 mt_kahypar_hypergraph_t readHMetisFile(const std::string& filename,
                                         const mt_kahypar_hypergraph_type_t& type,
                                         const bool stable_construction,
                                         const bool remove_single_pin_hes) {
+  if (type == COMPRESSED_HYPERGRAPH) return streamAndCompressHypergraphFile(filename, remove_single_pin_hes, stable_construction);
+
   HyperedgeID num_hyperedges = 0;
   HypernodeID num_hypernodes = 0;
   HyperedgeID num_removed_single_pin_hyperedges = 0;
@@ -95,6 +99,9 @@ mt_kahypar_hypergraph_t readHMetisFile(const std::string& filename,
           hyperedges_weight.data(), hypernodes_weight.data(),
           num_removed_single_pin_hyperedges, stable_construction);
       )
+    case COMPRESSED_HYPERGRAPH:
+      // Handled above
+      break;
     case NULLPTR_HYPERGRAPH:
       return mt_kahypar_hypergraph_t { nullptr, NULLPTR_HYPERGRAPH };
   }
@@ -105,6 +112,7 @@ mt_kahypar_hypergraph_t readHMetisFile(const std::string& filename,
 mt_kahypar_hypergraph_t readMetisFile(const std::string& filename,
                                       const mt_kahypar_hypergraph_type_t& type,
                                       const bool stable_construction) {
+  if (type == COMPRESSED_HYPERGRAPH) return streamAndCompressGraphFile(filename, stable_construction);
   HyperedgeID num_edges = 0;
   HypernodeID num_vertices = 0;
   HyperedgeVector edges;

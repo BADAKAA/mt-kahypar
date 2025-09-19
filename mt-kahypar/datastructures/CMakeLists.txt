@@ -4,6 +4,7 @@ set(DatastructureSources
 
 set(MultilevelDatastructureSources
       static_hypergraph_factory.cpp
+      compressed_hypergraph.cpp
       static_hypergraph.cpp)
 
 set(MultilevelGraphDatastructureSources
@@ -44,6 +45,7 @@ endif()
 set(ToolsDatastructureSources
       static_hypergraph_factory.cpp
       static_hypergraph.cpp
+      compressed_hypergraph.cpp
       static_graph_factory.cpp
       static_graph.cpp
       contraction_tree.cpp

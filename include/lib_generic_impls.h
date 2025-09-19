@@ -67,6 +67,8 @@ ReturnT switch_hg(mt_kahypar_hypergraph_t hg, Func f) {
       return f(utils::cast<DynamicGraph>(hg));
     case STATIC_HYPERGRAPH:
       return f(utils::cast<StaticHypergraph>(hg));
+    case COMPRESSED_HYPERGRAPH:
+      return f(utils::cast<CompressedHypergraph>(hg));
     case DYNAMIC_HYPERGRAPH:
       return f(utils::cast<DynamicHypergraph>(hg));
     case NULLPTR_HYPERGRAPH: break;
@@ -86,6 +88,7 @@ ReturnT switch_graph(mt_kahypar_hypergraph_t hg, Func f) {
       return f(utils::cast<DynamicGraph>(hg));
     case STATIC_HYPERGRAPH:
     case DYNAMIC_HYPERGRAPH:
+    case COMPRESSED_HYPERGRAPH:
     case NULLPTR_HYPERGRAPH:
       break;
   }
