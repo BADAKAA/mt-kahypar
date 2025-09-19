@@ -874,13 +874,36 @@ class StaticHypergraph {
 
   void memoryConsumption(utils::MemoryTreeNode* parent) const;
 
+  /**
+   * Returns an estimate of the memory used (in kilobytes) by the
+   * variable-size internal arrays of this hypergraph.
+   */
+  size_t memoryConsumptionKB() const {
+    size_t total = 0;
+    // Hypernode array
+    total += sizeof(Hypernode) * _hypernodes.size();
+    // Incident nets array
+    total += sizeof(HyperedgeID) * _incident_nets.size();
+    // Hyperedge array
+    total += sizeof(Hyperedge) * _hyperedges.size();
+    // Incidence array
+    total += sizeof(HypernodeID) * _incidence_array.size();
+    // Community IDs
+    total += sizeof(PartitionID) * _community_ids.capacity();
+    // Fixed‐vertex support (if present)
+    if (_fixed_vertices.hasFixedVertices()) {
+      total += _fixed_vertices.size_in_bytes();
+    }
+    // Temporary contraction buffer is not counted here
+    return total / 1024;
+  }
     // ! Only for testing
   bool verifyIncidenceArrayAndIncidentNets() {
     throw UnsupportedOperationException(
       "verifyIncidenceArrayAndIncidentNets() not supported in static hypergraph");
     return false;
   }
-
+  
  private:
   friend class StaticHypergraphFactory;
   template<typename Hypergraph>
