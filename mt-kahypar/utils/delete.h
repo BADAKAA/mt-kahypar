@@ -39,6 +39,7 @@ void delete_hypergraph(mt_kahypar_hypergraph_t hg) {
   if ( hg.hypergraph ) {
     switch ( hg.type ) {
       case STATIC_HYPERGRAPH: delete reinterpret_cast<ds::StaticHypergraph*>(hg.hypergraph); break;
+      case COMPRESSED_HYPERGRAPH: delete reinterpret_cast<ds::CompressedHypergraph*>(hg.hypergraph); break;
       ENABLE_GRAPHS(case STATIC_GRAPH: delete reinterpret_cast<ds::StaticGraph*>(hg.hypergraph); break;)
       ENABLE_HIGHEST_QUALITY(case DYNAMIC_HYPERGRAPH: delete reinterpret_cast<ds::DynamicHypergraph*>(hg.hypergraph); break;)
       ENABLE_HIGHEST_QUALITY_FOR_GRAPHS(case DYNAMIC_GRAPH: delete reinterpret_cast<ds::DynamicGraph*>(hg.hypergraph); break;)

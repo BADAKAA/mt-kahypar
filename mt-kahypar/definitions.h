@@ -68,7 +68,7 @@ struct DynamicGraphTypeTraits : public kahypar::meta::PolicyBase {
 
 struct CompressedHypergraphTypeTraits : public kahypar::meta::PolicyBase {
   using Hypergraph = ds::CompressedHypergraph;
-  using PartitionedHypergraph = StaticPartitionedHypergraph;
+  using PartitionedHypergraph = CompressedPartitionedHypergraph;
 };
 
 

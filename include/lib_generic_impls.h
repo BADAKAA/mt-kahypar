@@ -48,6 +48,7 @@ namespace lib {
   using DynamicGraph = typename DynamicGraphTypeTraits::Hypergraph;
   using StaticHypergraph = typename StaticHypergraphTypeTraits::Hypergraph;
   using DynamicHypergraph = typename DynamicHypergraphTypeTraits::Hypergraph;
+  using CompressedHypergraph = typename CompressedHypergraphTypeTraits::Hypergraph;
 
   using StaticPartitionedGraph = typename StaticGraphTypeTraits::PartitionedHypergraph;
   using DynamicPartitionedGraph = typename DynamicGraphTypeTraits::PartitionedHypergraph;
