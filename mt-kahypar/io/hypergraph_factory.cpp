@@ -112,7 +112,7 @@ mt_kahypar_hypergraph_t readHMetisFile(const std::string& filename,
 mt_kahypar_hypergraph_t readMetisFile(const std::string& filename,
                                       const mt_kahypar_hypergraph_type_t& type,
                                       const bool stable_construction) {
-  if (type == COMPRESSED_HYPERGRAPH) return streamAndCompressGraphFile(filename, stable_construction);
+  if (type == COMPRESSED_HYPERGRAPH) throw InvalidInputException("Compressed hypergraphs only support hMetis files.");
   HyperedgeID num_edges = 0;
   HypernodeID num_vertices = 0;
   HyperedgeVector edges;

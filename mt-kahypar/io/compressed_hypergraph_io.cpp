@@ -14,11 +14,5 @@ mt_kahypar_hypergraph_t streamAndCompressHypergraphFile(
   return { reinterpret_cast<mt_kahypar_hypergraph_s*>(hg), CHG::TYPE };
 }
 
-mt_kahypar_hypergraph_t streamAndCompressGraphFile(
-  const std::string& filename,
-  bool stable) {
-  return streamAndCompressHypergraphFile(filename, /*remove_single_pin_hes=*/false, stable);
-}
-
 } // namespace io
 } // namespace mt_kahypar
