@@ -52,8 +52,8 @@ using StaticPartitionedGraph = ds::PartitionedGraph<ds::StaticGraph>;
 using DynamicPartitionedGraph = ds::PartitionedGraph<ds::DynamicGraph>;
 using StaticPartitionedHypergraph = ds::PartitionedHypergraph<ds::StaticHypergraph, ds::ConnectivityInfo>;
 using DynamicPartitionedHypergraph = ds::PartitionedHypergraph<ds::DynamicHypergraph, ds::ConnectivityInfo>;
+using CompressedPartitionedHypergraph = ds::PartitionedHypergraph<ds::CompressedHypergraph, ds::ConnectivityInfo>;
 using StaticSparsePartitionedHypergraph = ds::PartitionedHypergraph<ds::StaticHypergraph, ds::SparseConnectivityInfo>;
-using CompressedPartitionedHypergraph = ds::PartitionedHypergraph<ds::CompressedHypergraph, ds::SparseConnectivityInfo>;
 
 struct StaticGraphTypeTraits : public kahypar::meta::PolicyBase {
   using Hypergraph = ds::StaticGraph;
@@ -65,12 +65,10 @@ struct DynamicGraphTypeTraits : public kahypar::meta::PolicyBase {
   using PartitionedHypergraph = DynamicPartitionedGraph;
 };
 
-
 struct CompressedHypergraphTypeTraits : public kahypar::meta::PolicyBase {
   using Hypergraph = ds::CompressedHypergraph;
   using PartitionedHypergraph = CompressedPartitionedHypergraph;
 };
-
 
 struct StaticHypergraphTypeTraits : public kahypar::meta::PolicyBase {
   using Hypergraph = ds::StaticHypergraph;
