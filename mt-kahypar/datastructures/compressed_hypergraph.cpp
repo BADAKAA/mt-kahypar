@@ -35,6 +35,10 @@
 #include <tbb/parallel_reduce.h>
 #include <tbb/parallel_sort.h>
 
+#include <unordered_map>
+#include <algorithm>
+#include <numeric>
+
 namespace mt_kahypar::ds {
 
 
@@ -58,11 +62,259 @@ namespace mt_kahypar::ds {
    *
    * \param communities Community structure that should be contracted
    */
-  CompressedHypergraph CompressedHypergraph::contract(parallel::scalable_vector<HypernodeID>& /* communities */, bool /* deterministic*/) {
-    throw UnsupportedOperationException(
-      "Contraction not yet implemented for compressed hypergraph");
-  }
+  CompressedHypergraph CompressedHypergraph::contract(parallel::scalable_vector<HypernodeID>& communities, bool deterministic) {
+    // Stage 0: Preconditions and helpers
+    ASSERT(communities.size() == _num_hypernodes);
 
+    auto map_to_coarse = [&](const HypernodeID hn) -> HypernodeID {
+      ASSERT(hn < communities.size());
+      return communities[hn];
+    };
+
+    // #################### STAGE 1 ####################
+    // Densify community IDs and compute number of coarse nodes
+    // We assume communities[hn] in [0, _num_hypernodes), but only enabled nodes count.
+    std::vector<uint8_t> present(_num_hypernodes, 0);
+    for (HypernodeID hn = 0; hn < _num_hypernodes; ++hn) {
+      if (nodeIsEnabled(hn)) {
+        const HypernodeID cid = communities[hn];
+        ASSERT(cid < _num_hypernodes);
+        present[cid] = 1;
+      } else {
+        communities[hn] = kInvalidHypernode;
+      }
+    }
+
+    std::vector<HypernodeID> label_to_coarse(_num_hypernodes, kInvalidHypernode);
+    HypernodeID next_coarse = 0;
+    for (HypernodeID lab = 0; lab < _num_hypernodes; ++lab) {
+      if (present[lab]) label_to_coarse[lab] = next_coarse++;
+    }
+    const HypernodeID num_coarse_nodes = next_coarse;
+
+    // Remap communities to dense IDs
+    for (HypernodeID hn = 0; hn < _num_hypernodes; ++hn) {
+      if (communities[hn] != kInvalidHypernode) {
+        communities[hn] = label_to_coarse[communities[hn]];
+      }
+    }
+
+    // Aggregate coarse node weights
+    std::vector<HypernodeWeight> coarse_node_weight(num_coarse_nodes, 0);
+    for (HypernodeID hn = 0; hn < _num_hypernodes; ++hn) {
+      const HypernodeID ch = communities[hn];
+      if (ch != kInvalidHypernode) {
+        coarse_node_weight[ch] += nodeWeight(hn);
+      }
+    }
+
+    // #################### STAGE 2 ####################
+    // Remap hyperedges to coarse graph, remove single-pin nets, and prepare for parallel merging
+    struct VectorHash {
+      size_t operator()(const std::vector<HypernodeID>& v) const noexcept {
+        // 64-bit mix (similar to boost::hash_combine)
+        size_t h = 1469598103934665603ull;
+        for (HypernodeID x : v) {
+          h ^= static_cast<size_t>(x) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        }
+        return h;
+      }
+    };
+
+    std::unordered_map<std::vector<HypernodeID>, HyperedgeID, VectorHash> parallel_map;
+    parallel_map.reserve(static_cast<size_t>(_num_hyperedges));
+
+    std::vector<std::vector<HypernodeID>> coarse_edges;       // pins per coarse edge (sorted, unique)
+    coarse_edges.reserve(static_cast<size_t>(_num_hyperedges));
+    std::vector<HyperedgeWeight> coarse_edge_weight;          // merged weights
+    coarse_edge_weight.reserve(static_cast<size_t>(_num_hyperedges));
+
+    // Decode every enabled edge, map to coarse, sort+unique, drop single-pin,
+    // and merge parallel hyperedges by identical pin sets.
+    for (HyperedgeID he = 0; he < _num_hyperedges; ++he) {
+      if (!edgeIsEnabled(he)) continue;
+
+      const auto& e = _hyperedges[he];
+      const size_t begin = e.firstEntry();
+      const size_t end   = e.firstInvalidEntry();
+      size_t pos = begin;
+      HypernodeID prev = 0;
+
+      std::vector<HypernodeID> pins;
+      pins.reserve(e.size()); // uncompressed size available
+      while (pos < end) {
+        uint64_t gap = decode_varint(_compressed_incidence_array, pos);
+        HypernodeID v = static_cast<HypernodeID>(prev + gap);
+        prev = v;
+        const HypernodeID ch = map_to_coarse(v);
+        if (ch != kInvalidHypernode) {
+          pins.push_back(ch);
+        }
+      }
+      if (pins.empty()) continue;
+
+      std::sort(pins.begin(), pins.end());
+      pins.erase(std::unique(pins.begin(), pins.end()), pins.end());
+
+      if (pins.size() <= 1) {
+        // becomes single-pin in coarse graph => drop
+        continue;
+      }
+
+      auto it = parallel_map.find(pins);
+      if (it == parallel_map.end()) {
+        HyperedgeID new_id = static_cast<HyperedgeID>(coarse_edges.size());
+        parallel_map.emplace(pins, new_id);
+        coarse_edge_weight.push_back(e.weight());
+        coarse_edges.emplace_back(std::move(pins));
+      } else {
+        // parallel net: accumulate weights
+        coarse_edge_weight[it->second] += e.weight();
+      }
+    }
+
+    // Determinism: optional reordering by pins to stabilize IDs
+    // We keep insertion order for performance; if requested, sort by pins lexicographically
+    if (deterministic) {
+      // Build permutation by comparing pin vectors
+      std::vector<HyperedgeID> perm(coarse_edges.size());
+      std::iota(perm.begin(), perm.end(), 0);
+      std::stable_sort(perm.begin(), perm.end(), [&](HyperedgeID a, HyperedgeID b) {
+        const auto& A = coarse_edges[a];
+        const auto& B = coarse_edges[b];
+        return std::lexicographical_compare(A.begin(), A.end(), B.begin(), B.end());
+      });
+      // Apply permutation
+      std::vector<std::vector<HypernodeID>> edges_sorted;
+      edges_sorted.reserve(coarse_edges.size());
+      std::vector<HyperedgeWeight> weights_sorted;
+      weights_sorted.reserve(coarse_edges.size());
+      std::vector<HyperedgeID> old_to_new(coarse_edges.size());
+      for (HyperedgeID new_id = 0; new_id < perm.size(); ++new_id) {
+        edges_sorted.emplace_back(std::move(coarse_edges[perm[new_id]]));
+        weights_sorted.emplace_back(coarse_edge_weight[perm[new_id]]);
+        old_to_new[perm[new_id]] = new_id;
+      }
+      coarse_edges = std::move(edges_sorted);
+      coarse_edge_weight = std::move(weights_sorted);
+      // No need to update parallel_map further, we won't use it anymore.
+      (void)old_to_new;
+    }
+
+    // #################### STAGE 3 ####################
+    // Build coarse hypergraph with compressed storage
+    CompressedHypergraph hypergraph;
+    hypergraph._num_hypernodes = num_coarse_nodes;
+    hypergraph._num_hyperedges = static_cast<HyperedgeID>(coarse_edges.size());
+    hypergraph._num_removed_hyperedges = 0;
+    hypergraph._max_edge_size = 0;
+    hypergraph._num_pins = 0;
+    hypergraph._total_degree = 0;
+    hypergraph._total_weight = 0;
+
+    // Init containers
+    hypergraph._hypernodes.resize(num_coarse_nodes);
+    hypergraph._hyperedges.resize(hypergraph._num_hyperedges);
+    hypergraph._compressed_incidence_array.clear();
+    hypergraph._compressed_incident_nets.clear();
+
+    // Enable nodes and set weights; prepare incident nets buckets
+    std::vector<std::vector<HyperedgeID>> incident_nets(num_coarse_nodes);
+    for (HypernodeID u = 0; u < num_coarse_nodes; ++u) {
+      auto& hn = hypergraph._hypernodes[u];
+      hn.enable();
+      hn.setWeight(coarse_node_weight[u]);
+      // firstEntry/compressed sizes set later
+    }
+
+    // Encode coarse edges (pins) and collect incident nets
+    size_t pins_bytes_offset = 0;
+    for (HyperedgeID he = 0; he < hypergraph._num_hyperedges; ++he) {
+      const auto& pins = coarse_edges[he];
+      auto& out_he = hypergraph._hyperedges[he];
+      out_he.enable();
+      out_he.setFirstEntry(pins_bytes_offset);
+      out_he.setUncompressedSize(pins.size());
+      out_he.setWeight(coarse_edge_weight[he]);
+
+      // Varint gap-encode pins
+      HypernodeID prev = 0;
+      for (HypernodeID v : pins) {
+        uint64_t gap = static_cast<uint64_t>(v - prev);
+        encode_varint(gap, hypergraph._compressed_incidence_array);
+        prev = v;
+      }
+      const size_t new_end = hypergraph._compressed_incidence_array.size();
+      const size_t written = new_end - pins_bytes_offset;
+      out_he.setCompressedSize(written);
+      pins_bytes_offset = new_end;
+
+      hypergraph._num_pins += static_cast<HypernodeID>(pins.size());
+      if (pins.size() > static_cast<size_t>(hypergraph._max_edge_size)) {
+        hypergraph._max_edge_size = static_cast<HypernodeID>(pins.size());
+      }
+      // Fill incident nets buckets
+      for (HypernodeID v : pins) {
+        incident_nets[v].push_back(he);
+      }
+    }
+
+    // Encode incident nets per node
+    size_t nets_bytes_offset = 0;
+    HypernodeWeight tw = 0;
+    for (HypernodeID u = 0; u < num_coarse_nodes; ++u) {
+      auto& hn = hypergraph._hypernodes[u];
+      auto& list = incident_nets[u];
+
+      std::sort(list.begin(), list.end());
+      list.erase(std::unique(list.begin(), list.end()), list.end());
+
+      hn.setFirstEntry(nets_bytes_offset);
+      hn.setUncompressedSize(list.size());
+
+      HyperedgeID prev_e = 0;
+      for (HyperedgeID e : list) {
+        uint64_t gap = static_cast<uint64_t>(e - prev_e);
+        encode_varint(gap, hypergraph._compressed_incident_nets);
+        prev_e = e;
+      }
+      const size_t new_end = hypergraph._compressed_incident_nets.size();
+      const size_t written = new_end - nets_bytes_offset;
+      hn.setCompressedSize(written);
+      nets_bytes_offset = new_end;
+
+      hypergraph._total_degree += static_cast<HypernodeID>(list.size());
+      tw += hn.weight();
+    }
+    hypergraph._total_weight = tw;
+
+    // #################### STAGE 4 ####################
+    // Communities: inherit from fine graph (like static version)
+    hypergraph._community_ids.assign(num_coarse_nodes, 0);
+    for (HypernodeID hn = 0; hn < _num_hypernodes; ++hn) {
+      const HypernodeID ch = communities[hn];
+      if (ch != kInvalidHypernode) {
+        hypergraph._community_ids[ch] = communityID(hn);
+      }
+    }
+
+    // Fixed vertices
+    if (hasFixedVertices()) {
+      FixedVertexSupport<CompressedHypergraph> coarse_fixed(hypergraph.initialNumNodes(), _fixed_vertices.numBlocks());
+      coarse_fixed.setHypergraph(&hypergraph);
+      for (HypernodeID hn = 0; hn < _num_hypernodes; ++hn) {
+        if (isFixed(hn)) {
+          const HypernodeID ch = communities[hn];
+          if (ch != kInvalidHypernode) {
+            coarse_fixed.fixToBlock(ch, fixedVertexBlock(hn));
+          }
+        }
+      }
+      hypergraph.addFixedVertexSupport(std::move(coarse_fixed));
+    }
+
+    return hypergraph;
+  }
 
   // ! Copy compressed hypergraph in parallel
   CompressedHypergraph CompressedHypergraph::copy(parallel_tag_t) const {
