@@ -14,6 +14,7 @@ namespace fs = std::filesystem;
 #include "mt-kahypar/io/hypergraph_factory.h"
 #include "mt-kahypar/io/partitioning_output.h"
 #include "mt-kahypar/io/presets.h"
+#include "mt-kahypar/parallel/tbb_initializer.h"
 #include "mt-kahypar/partition/conversion.h"
 #include "mt-kahypar/partition/mapping/target_graph.h"
 #include "mt-kahypar/partition/partitioner_facade.h"
@@ -27,144 +28,37 @@ namespace fs = std::filesystem;
 
 using namespace mt_kahypar;
 
-void write_csv_header(const char* csv_path) {
+void write_csv_header(const std::string& csv_path) {
     std::ofstream outfile(csv_path, std::ios::trunc);  // Overwrite if exists
-    outfile
-        << "FileName,NodeCount,HyperedgeCount,IOTimeMS,MemoryUsage,Compressed"
-        << std::endl;
-}
-
-void append_csv_line(const char* csv_path, const char* filename,
-                     size_t num_nodes, size_t num_hyperedges, long long io_time,
-                     size_t memory_usage, bool compressed) {
-    std::ofstream outfile(csv_path, std::ios::app);
-    outfile << filename << "," << num_nodes << "," << num_hyperedges << ","
-            << io_time << "," << memory_usage << "," << (compressed ? "1" : "0")
+    outfile << "FileName,NodeCount,HyperedgeCount,IOTimeMS,PartitionTimeMS,"
+               "MemoryUsage,Compressed"
             << std::endl;
 }
 
-void write_graph() {}
-
-void read_hypergraph(const char* path, const char* OUTPUT_PATH,
-                     bool compressed = false) {
-    auto start = std::chrono::high_resolution_clock::now();
-
-    // COMPRESSION_TODO
-    // mt_kahypar_hypergraph_t hypergraph = io::readInputFile(
-    //     context.partition.graph_filename, context.partition.preset_type,
-    //     context.partition.instance_type, context.partition.file_format,
-    //     context.preprocessing.stable_construction_of_incident_edges);
-    std::cout << "Using compressed hypergraph format." << std::endl;
-    mt_kahypar_hypergraph_t hypergraph =
-        io::readInputFile(path, PresetType::default_preset,
-                          compressed ? InstanceType::compressed_hypergraph
-                                     : InstanceType::hypergraph,
-                          FileFormat::hMetis, false);
-    auto end = std::chrono::high_resolution_clock::now();
-    long long io_time =
-        std::chrono::duration_cast<std::chrono::milliseconds>(end - start)
-            .count();
-
-    if (compressed) {
-        const ds::CompressedHypergraph& hg =
-            utils::cast<ds::CompressedHypergraph>(hypergraph);
-        append_csv_line(OUTPUT_PATH, path, hg.initialNumNodes(),
-                        hg.initialNumEdges(), io_time, hg.memoryConsumptionKB(),
-                        compressed);
-    } else {
-        const ds::StaticHypergraph& hg =
-            utils::cast<ds::StaticHypergraph>(hypergraph);
-        append_csv_line(OUTPUT_PATH, path, hg.initialNumNodes(),
-                        hg.initialNumEdges(), io_time, hg.memoryConsumptionKB(),
-                        compressed);
-    }
-
-    // std::vector<size_t> partition;
-    //     mt_kahypar_error_t error{};
-
-    //     mt_kahypar_initialize(
-    //         std::thread::hardware_concurrency(),
-    //         true
-    //     );
-
-    //     mt_kahypar_context_t* context =
-    //     mt_kahypar_context_from_preset(DEFAULT);
-    //     mt_kahypar_set_partitioning_parameters(context, 3, 0.03, CUT);
-    //     mt_kahypar_set_seed(42);
-    //     mt_kahypar_set_context_parameter(context, VERBOSE, "0", &error);
-
-    //     mt_kahypar_hypergraph_t hypergraph =  compressed
-    //         ? mt_kahypar_stream_hypergraph_from_file(path, context, HMETIS,
-    //         &error) : mt_kahypar_read_hypergraph_from_file(path, context,
-    //         HMETIS, &error);
-    //     // io::readInputFile(file_name, context.partition.preset_type,
-    //     instance_type, file_format, true) if (hypergraph.hypergraph ==
-    //     nullptr) {
-    //         std::cout << error.msg << std::endl;
-    //         std::exit(1);
-    //     }
-
-    //     size_t num_nodes = mt_kahypar_num_hypernodes(hypergraph);
-    //     size_t num_hyperedges = mt_kahypar_num_hyperedges(hypergraph);
-    //     // size_t num_pins = mt_kahypar_num_pins(hypergraph);
-    //     // size_t total_weight = mt_kahypar_hypergraph_weight(hypergraph);
-
-    //     auto end = std::chrono::high_resolution_clock::now();
-    //     long long partition_time =
-    //     std::chrono::duration_cast<std::chrono::milliseconds>(end -
-    //     start).count();
-
-    //     size_t memory_usage = mt_kahypar_memory_kb(hypergraph);
-
-    //     append_csv_line(OUTPUT_PATH, path, num_nodes, num_hyperedges,
-    //     partition_time, memory_usage, compressed);
-
-    //     mt_kahypar_free_context(context);
-    //     mt_kahypar_free_hypergraph(hypergraph);
+void append_csv_line(const std::string& csv_path, const std::string& filename,
+                     size_t num_nodes, size_t num_hyperedges, size_t io_time,
+                     size_t partition_time, size_t memory_usage,
+                     bool compressed) {
+    std::ofstream outfile(csv_path, std::ios::app);
+    outfile << filename << "," << num_nodes << "," << num_hyperedges << ","
+            << io_time << "," << partition_time << "," << memory_usage << ","
+            << (compressed ? "1" : "0") << std::endl;
 }
 
-void print_progress(size_t current, size_t total) {
-    const int bar_width = 50;  // Width of the progress bar
-    float progress = static_cast<float>(current) / total;
+void partition_graph(const std::string& filename, bool compressed, Context& context,
+                     const std::string& OUTPUT_PATH) {
+		context.partition.verbose_output = false;
+    context.partition.graph_filename = filename;
+    context.partition.instance_type = compressed
+                                          ? InstanceType::compressed_hypergraph
+                                          : InstanceType::hypergraph;
 
-    std::cout << "\r[";
-    int pos = static_cast<int>(bar_width * progress);
-    for (int i = 0; i < bar_width; ++i) {
-        if (i < pos)
-            std::cout << "=";
-        else if (i == pos)
-            std::cout << ">";
-        else
-            std::cout << " ";
-    }
-    std::cout << "] " << current << "/" << total << " files" << std::flush;
-}
-
-int main(int argc, char* argv[]) {
-    Context context(false);
-    processCommandLineInput(context, argc, argv, nullptr);
-
-    if (context.partition.preset_file == "") {
-        if (context.partition.preset_type != PresetType::UNDEFINED)
-            throw InvalidInputException("No preset specified");
-        // Only a preset type specified => load according preset
-        auto preset_option_list = loadPreset(context.partition.preset_type);
-        processCommandLineInput(context, argc, argv, &preset_option_list);
-    }
-
-    // Determine instance (graph or hypergraph) and partition type
-    if (context.partition.instance_type == InstanceType::UNDEFINED) {
-        context.partition.instance_type =
-            to_instance_type(context.partition.file_format);
-    }
     context.partition.partition_type = to_partition_c_type(
         context.partition.preset_type, context.partition.instance_type);
 
     context.utility_id =
         utils::Utilities::instance().registerNewUtilityObjects();
-    if (context.partition.verbose_output) {
-        io::printBanner();
-    }
+    if (context.partition.verbose_output) io::printBanner();
 
     utils::Randomize::instance().setSeed(context.partition.seed);
     if (context.shared_memory.use_localized_random_shuffle) {
@@ -196,40 +90,144 @@ int main(int argc, char* argv[]) {
     hwloc_bitmap_free(cpuset);
 #endif
 
-    const char* OUTPUT_PATH = "benchmark.csv";
+		HighResClockTimepoint start = std::chrono::high_resolution_clock::now();
+    // Read Hypergraph
+    utils::Timer& timer =
+        utils::Utilities::instance().getTimer(context.utility_id);
+    timer.start_timer("io_hypergraph", "I/O Hypergraph");
+
+    mt_kahypar_hypergraph_t hypergraph = io::readInputFile(
+        context.partition.graph_filename, context.partition.preset_type,
+        context.partition.instance_type, context.partition.file_format,
+        context.preprocessing.stable_construction_of_incident_edges);
+
+    timer.stop_timer("io_hypergraph");
+		HighResClockTimepoint end = std::chrono::high_resolution_clock::now();
+		size_t io_time = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
+    // Read Target Graph
+    std::unique_ptr<TargetGraph> target_graph;
+    if (context.partition.objective == Objective::steiner_tree) {
+        if (context.mapping.target_graph_file != "") {
+            target_graph = std::make_unique<TargetGraph>(
+                io::readInputFile<ds::StaticGraph>(
+                    context.mapping.target_graph_file, FileFormat::Metis,
+                    true));
+        } else {
+            throw InvalidInputException(
+                "No target graph file specified (use -g <file> or "
+                "--target-graph-file=<file>)!");
+        }
+    }
+
+    if (context.partition.fixed_vertex_filename != "") {
+        timer.start_timer("read_fixed_vertices", "Read Fixed Vertex File");
+        io::addFixedVerticesFromFile(hypergraph,
+                                     context.partition.fixed_vertex_filename,
+                                     context.partition.k);
+        timer.stop_timer("read_fixed_vertices");
+    }
+
+    // Initialize Memory Pool and Algorithm/Policy Registries
+    register_memory_pool(hypergraph, context);
+    register_algorithms_and_policies();
+
+    // Partition Hypergraph
+    start = std::chrono::high_resolution_clock::now();
+    mt_kahypar_partitioned_hypergraph_t partitioned_hypergraph =
+        PartitionerFacade::partition(hypergraph, context, target_graph.get());
+    end = std::chrono::high_resolution_clock::now();
+
+		size_t partition_time = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    // Print Stats
+    std::chrono::duration<double> elapsed_seconds(end - start);
+    PartitionerFacade::printPartitioningResults(partitioned_hypergraph, context,
+                                                elapsed_seconds);
+    if (context.partition.sp_process_output) {
+        std::cout << PartitionerFacade::serializeResultLine(
+                         partitioned_hypergraph, context, elapsed_seconds)
+                  << std::endl;
+    }
+    if (context.partition.csv_output) {
+        std::cout << PartitionerFacade::serializeCSV(partitioned_hypergraph,
+                                                     context, elapsed_seconds)
+                  << std::endl;
+    }
+    if (context.partition.write_partition_file) {
+        PartitionerFacade::writePartitionFile(
+            partitioned_hypergraph, context.partition.graph_partition_filename);
+    }
+    if (compressed) {
+        const ds::CompressedHypergraph& hg =
+            utils::cast<ds::CompressedHypergraph>(hypergraph);
+        append_csv_line(OUTPUT_PATH, filename, hg.initialNumNodes(),
+                        hg.initialNumEdges(), io_time, partition_time, hg.memoryConsumptionKB(),
+                        compressed);
+    } else {
+        const ds::StaticHypergraph& hg =
+            utils::cast<ds::StaticHypergraph>(hypergraph);
+        append_csv_line(OUTPUT_PATH, filename, hg.initialNumNodes(),
+                        hg.initialNumEdges(), io_time, partition_time, hg.memoryConsumptionKB(),
+                        compressed);
+    }
+
+    parallel::MemoryPool::instance().free_memory_chunks();
+    TBBInitializer::instance().terminate();
+
+    utils::delete_hypergraph(hypergraph);
+    utils::delete_partitioned_hypergraph(partitioned_hypergraph);
+}
+
+void print_progress(size_t current, size_t total) {
+    const int bar_width = 50;  // Width of the progress bar
+    float progress = static_cast<float>(current) / total;
+
+    std::cout << "\r[";
+    int pos = static_cast<int>(bar_width * progress);
+    for (int i = 0; i < bar_width; ++i) {
+        if (i < pos)
+            std::cout << "=";
+        else if (i == pos)
+            std::cout << ">";
+        else
+            std::cout << " ";
+    }
+    std::cout << "] " << current << "/" << total << " files" << std::flush;
+}
+
+int main(int argc, char* argv[]) {
+    Context context(false);
+    processCommandLineInput(context, argc, argv, nullptr);
+
+    fs::create_directories("./__out");
+
+    const std::string OUTPUT_PATH = "./__out/benchmark.csv";
+
     write_csv_header(OUTPUT_PATH);
-    read_hypergraph("./_graphs/benchmark_set_d/vibrobox.mtx.hgr", OUTPUT_PATH,
-                    true);
-    read_hypergraph("./_graphs/benchmark_set_d/vibrobox.mtx.hgr", OUTPUT_PATH,
-                    false);
 
-    //   const char* OUTPUT_PATH = "benchmark.csv";
-    // write_csv_header(OUTPUT_PATH);
+    const std::string directory = "./_graphs/test";
 
-    // const std::string directory = "./benchmark_set_b";
+    // Collect all regular files first
+    std::vector<fs::path> files;
+    for (const auto& entry : fs::directory_iterator(directory)) {
+        if (!fs::is_regular_file(entry)) continue;
+        files.push_back(entry.path());
+    }
 
-    // // Collect all regular files first
-    // std::vector<fs::path> files;
-    // for (const auto& entry : fs::directory_iterator(directory)) {
-    //     if (fs::is_regular_file(entry)) {
-    //         files.push_back(entry.path());
-    //     }
-    // }
+    size_t total = files.size();
+    if (total == 0) {
+        std::cout << "No files found in " << directory << std::endl;
+        return 1;
+    }
 
-    // size_t total = files.size();
-    // if (total == 0) {
-    //     std::cout << "No files found in " << directory << std::endl;
-    //     return 1;
-    // }
+    size_t count = 0;
+    for (const auto& path : files) {
+        ++count;
+        partition_graph(path.string(), false, context, OUTPUT_PATH);
+        partition_graph(path.string(), true, context, OUTPUT_PATH);
+        print_progress(count, total);
+    }
 
-    // size_t count = 0;
-    // for (const auto& path : files) {
-    //     ++count;
-    //     read_hypergraph(path.string().c_str(), OUTPUT_PATH);
-    //     read_hypergraph(path.string().c_str(), OUTPUT_PATH, true);
-    //     print_progress(count, total);
-    // }
-
-    // std::cout << std::endl << "Processing complete." << std::endl;
+    std::cout << std::endl << "Processing complete." << std::endl;
     return 0;
 }
