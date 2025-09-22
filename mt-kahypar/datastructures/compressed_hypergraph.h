@@ -44,7 +44,7 @@ namespace mt_kahypar {
 namespace ds {
 
 // Forward declarations
-// class CompressedHypergraphFactory;
+class CompressedHypergraphFactory;
 template <typename Hypergraph,
           typename ConnectivityInformation>
 class PartitionedHypergraph;
@@ -322,9 +322,12 @@ class CompressedHypergraph {
             _end_pos(end_pos),
             _current_pos(start_pos),
             _current_value(0),
-            _accumulated_value(0) {
+            _accumulated_value(0),
+            _has_value(false) {
+            // Preload first value if available
             if (_current_pos < _end_pos) {
                 advance();
+                _has_value = true;
             }
         }
 
@@ -335,15 +338,22 @@ class CompressedHypergraph {
             _end_pos(end_pos),
             _current_pos(end_pos),
             _current_value(0),
-            _accumulated_value(0) {}
+            _accumulated_value(0),
+            _has_value(false) {}
 
         HypernodeID operator*() const {
+            ASSERT(_has_value);
             return _current_value;
         }
 
         CompressedIterator& operator++() {
+            if (!_has_value) return *this; // already at end
             if (_current_pos < _end_pos) {
                 advance();
+                _has_value = true;
+            } else {
+                // We have just consumed the last value; mark as end
+                _has_value = false;
             }
             return *this;
         }
@@ -355,11 +365,12 @@ class CompressedHypergraph {
         }
 
         bool operator!=(const CompressedIterator& rhs) const {
-            return _current_pos != rhs._current_pos;
+            // Treat end iterator as any iterator with no current value
+            return _has_value != rhs._has_value;
         }
 
         bool operator==(const CompressedIterator& rhs) const {
-            return _current_pos == rhs._current_pos;
+            return _has_value == rhs._has_value;
         }
 
     private:
@@ -377,6 +388,7 @@ class CompressedHypergraph {
         size_t _current_pos;
         HypernodeID _current_value;
         HypernodeID _accumulated_value;
+        bool _has_value;
     };
 
     /**
@@ -473,10 +485,10 @@ public:
     static constexpr bool is_partitioned = false;
     static constexpr size_t SIZE_OF_HYPERNODE = sizeof(Hypernode);
     static constexpr size_t SIZE_OF_HYPEREDGE = sizeof(Hyperedge);
-    static constexpr mt_kahypar_hypergraph_type_t TYPE = STATIC_HYPERGRAPH;
+    static constexpr mt_kahypar_hypergraph_type_t TYPE = COMPRESSED_HYPERGRAPH;
 
     // Factory
-    // using Factory = CompressedHypergraphFactory;
+    using Factory = CompressedHypergraphFactory;
 
     // Iterator types
     using HypernodeIterator = HypergraphElementIterator<Hypernode>;
@@ -559,10 +571,6 @@ public:
     }
 
     ~CompressedHypergraph() {
-        if (_tmp_contraction_buffer) {
-            delete(_tmp_contraction_buffer);
-            _tmp_contraction_buffer = nullptr;
-        }
         freeInternalData();
     }
 
@@ -604,12 +612,7 @@ public:
         return _total_weight;
     }
 
-    void computeAndSetTotalNodeWeight() {
-        _total_weight = 0;
-        for (const HypernodeID hn : nodes()) {
-            _total_weight += nodeWeight(hn);
-        }
-    }
+    void computeAndSetTotalNodeWeight(parallel_tag_t);
 
     // ####################### Iterators #######################
 
@@ -789,11 +792,11 @@ public:
     // ####################### Contract / Uncontract #######################
 
     // COMPRESSION_TODO
-    CompressedHypergraph contract(std::vector<HypernodeID>& communities, bool deterministic = false);
+    CompressedHypergraph contract(parallel::scalable_vector<HypernodeID>& communities, bool deterministic = false);
 
     bool registerContraction(const HypernodeID, const HypernodeID) {
         throw UnsupportedOperationException(
-            "registerContraction(u, v) is not supported in static hypergraph");
+            "registerContraction(u, v) is not supported in compressed hypergraph");
         return false;
     }
 
@@ -801,7 +804,7 @@ public:
                    const HypernodeWeight max_node_weight = std::numeric_limits<HypernodeWeight>::max()) {
         unused(max_node_weight);
         throw UnsupportedOperationException(
-            "contract(v, max_node_weight) is not supported in static hypergraph");
+            "contract(v, max_node_weight) is not supported in compressed hypergraph");
         return 0;
     }
 
@@ -811,12 +814,12 @@ public:
     unused(case_one_func);
     unused(case_two_func);
         throw UnsupportedOperationException(
-            "uncontract(batch) is not supported in static hypergraph");
+            "uncontract(batch) is not supported in compressed hypergraph");
     }
 
     std::vector<std::vector<HypernodeID>> createBatchUncontractionHierarchy(const size_t) {
         throw UnsupportedOperationException(
-            "createBatchUncontractionHierarchy(batch_size) is not supported in static hypergraph");
+            "createBatchUncontractionHierarchy(batch_size) is not supported in compressed hypergraph");
         return {};
     }
 
@@ -839,13 +842,13 @@ public:
 
     std::vector<HyperedgeID> removeSinglePinAndParallelHyperedges() {
         throw UnsupportedOperationException(
-            "removeSinglePinAndParallelHyperedges() is not supported in static hypergraph");
+            "removeSinglePinAndParallelHyperedges() is not supported in compressed hypergraph");
         return {};
     }
 
     void restoreSinglePinAndParallelNets(const std::vector<HyperedgeID>&) {
         throw UnsupportedOperationException(
-            "restoreSinglePinAndParallelNets(hes_to_restore) is not supported in static hypergraph");
+            "restoreSinglePinAndParallelNets(hes_to_restore) is not supported in compressed hypergraph");
     }
 
     // ####################### Initialization / Reset Functions #######################
@@ -862,20 +865,39 @@ public:
         _community_ids = std::move(communities);
     }
 
-    CompressedHypergraph copy() const {
-        throw UnsupportedOperationException(
-            "copy() not yet implemented for compressed hypergraph");
-        return CompressedHypergraph();
-    }
+    // ! Copy compressed hypergraph in parallel
+    CompressedHypergraph copy(parallel_tag_t) const;
+
+    // ! Copy compressed hypergraph sequential
+    CompressedHypergraph copy() const;
 
     void reset() { }
 
     void freeInternalData() {
-        if (_num_hypernodes > 0 || _num_hyperedges > 0) {
-            freeTmpContractionBuffer();
-        }
+        // Delete any temporary contraction buffer
+        freeTmpContractionBuffer();
+        // Release main containers
+        _hypernodes.clear();
+        _hypernodes.shrink_to_fit();
+        _compressed_incident_nets.clear();
+        _compressed_incident_nets.shrink_to_fit();
+        _hyperedges.clear();
+        _hyperedges.shrink_to_fit();
+        _compressed_incidence_array.clear();
+        _compressed_incidence_array.shrink_to_fit();
+        _community_ids.clear();
+        _community_ids.shrink_to_fit();
+        _fixed_vertices = FixedVertexSupport<CompressedHypergraph>();
+        // Reset stats
         _num_hypernodes = 0;
+        _num_removed_hypernodes = 0;
+        _removed_degree_zero_hn_weight = 0;
         _num_hyperedges = 0;
+        _num_removed_hyperedges = 0;
+        _max_edge_size = 0;
+        _num_pins = 0;
+        _total_degree = 0;
+        _total_weight = 0;
     }
 
     void freeTmpContractionBuffer() {
@@ -885,21 +907,15 @@ public:
         }
     }
 
-    // void memoryConsumption(utils::MemoryTreeNode* parent) const {}
+    void memoryConsumption(utils::MemoryTreeNode* parent) const;
 
     size_t memoryConsumptionKB() const {
         size_t total = 0;
-        // Hypernodes array
         total += sizeof(Hypernode) * _hypernodes.size();
-        // Compressed incident‐nets storage
         total += sizeof(uint8_t) * _compressed_incident_nets.size();
-        // Hyperedges array
         total += sizeof(Hyperedge) * _hyperedges.size();
-        // Compressed incidence array (pins)
         total += sizeof(uint8_t) * _compressed_incidence_array.size();
-        // Community IDs
         total += sizeof(PartitionID) * _community_ids.capacity();
-        // Fixed‐vertex support, if any
         if (_fixed_vertices.hasFixedVertices()) {
         total += _fixed_vertices.size_in_bytes();
         }
@@ -908,12 +924,12 @@ public:
 
     bool verifyIncidenceArrayAndIncidentNets() {
         throw UnsupportedOperationException(
-            "verifyIncidenceArrayAndIncidentNets() not supported in static hypergraph");
+            "verifyIncidenceArrayAndIncidentNets() not supported in compressed hypergraph");
         return false;
     }
 
 private:
-    // friend class CompressedHypergraphFactory;
+    friend class CompressedHypergraphFactory;
     template <typename Hypergraph,
           typename ConnectivityInformation>
     friend class PartitionedHypergraph;
@@ -969,7 +985,7 @@ private:
     FixedVertexSupport<CompressedHypergraph> _fixed_vertices;
 
     // Data reused throughout multilevel hierarchy
-    TmpContractionBuffer* _tmp_contraction_buffer;
+    TmpContractionBuffer* _tmp_contraction_buffer = nullptr;
 };
 
 } // namespace ds

@@ -880,17 +880,11 @@ class StaticHypergraph {
    */
   size_t memoryConsumptionKB() const {
     size_t total = 0;
-    // Hypernode array
     total += sizeof(Hypernode) * _hypernodes.size();
-    // Incident nets array
     total += sizeof(HyperedgeID) * _incident_nets.size();
-    // Hyperedge array
     total += sizeof(Hyperedge) * _hyperedges.size();
-    // Incidence array
     total += sizeof(HypernodeID) * _incidence_array.size();
-    // Community IDs
     total += sizeof(PartitionID) * _community_ids.capacity();
-    // Fixed‐vertex support (if present)
     if (_fixed_vertices.hasFixedVertices()) {
       total += _fixed_vertices.size_in_bytes();
     }

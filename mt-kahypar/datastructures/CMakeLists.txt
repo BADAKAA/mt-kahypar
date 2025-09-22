@@ -3,8 +3,9 @@ set(DatastructureSources
       fixed_vertex_support.cpp)
 
 set(MultilevelDatastructureSources
-      static_hypergraph_factory.cpp
+      compressed_hypergraph_factory.cpp
       compressed_hypergraph.cpp
+      static_hypergraph_factory.cpp
       static_hypergraph.cpp)
 
 set(MultilevelGraphDatastructureSources
@@ -46,6 +47,7 @@ set(ToolsDatastructureSources
       static_hypergraph_factory.cpp
       static_hypergraph.cpp
       compressed_hypergraph.cpp
+      compressed_hypergraph_factory.cpp
       static_graph_factory.cpp
       static_graph.cpp
       contraction_tree.cpp
