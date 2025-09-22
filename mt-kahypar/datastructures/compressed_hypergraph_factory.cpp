@@ -24,8 +24,7 @@ static inline size_t parseRawNumbers(const std::string& line, std::vector<size_t
   out.clear();
   const char* ptr = line.c_str();
   const char* end = ptr + line.size();
-  size_t first = 0;
-  bool first_extracted = !exclude_first;
+  size_t first;
   while (ptr < end) {
     while (ptr < end && (is_space(*ptr) || *ptr == ',')) ++ptr;
     if (ptr >= end) break;
@@ -35,14 +34,13 @@ static inline size_t parseRawNumbers(const std::string& line, std::vector<size_t
     if (ec != std::errc()) {
       throw InvalidInputException("Invalid number in input line: " + (line.size() <= 40 ? line : line.substr(0, 40) + "..."));
     }
-    if (!first_extracted) {
+    if (exclude_first) {
       first = v;
-      first_extracted = true;
+      exclude_first = false;
       continue;
     } 
     out.push_back(v);
   }
-  if (!first_extracted) throw InvalidInputException("Expected first value in input line but found none");
   return first;
 }
 
@@ -84,7 +82,25 @@ static inline size_t push_varint(std::vector<uint8_t>& out, size_t x) {
   return blocks;
 }
 
+size_t get_last_varint(std::vector<uint8_t>& vec) {
+  if (vec.empty()) return 0;
+  size_t pos = vec.size() - 1;
+  size_t result = 0;
+  int shift = 0;
+  while (true) {
+    uint8_t byte = vec[pos];
+    result |= (static_cast<size_t>(byte & 0x7Fu) << shift);
+    if ((byte & 0x80u) == 0) break;
+    if (pos == 0) throw InvalidInputException("Malformed varint in vector");
+    --pos;
+    shift += 7;
+  }
+  return result;
+}
+
 CompressedHypergraph CompressedHypergraphFactory::stream(const std::string& filename, const bool remove_single_pin_hes) {
+  using Hypernode = CompressedHypergraph::Hypernode;
+
   std::ifstream in(filename);
   if (!in) throw mt_kahypar::SystemException("Cannot open file: " + filename);
 
@@ -107,10 +123,11 @@ CompressedHypergraph CompressedHypergraphFactory::stream(const std::string& file
   hg._total_degree = 0;
   hg._total_weight = 0;
 
-  // Initialize CSR structures and enabled flags
-  hg._hypernode_offsets.assign(V, 0);
-  hg._hypernode_enabled.assign(V, true);
-  hg._hyperedge_enabled.reserve(H);
+  hg._hypernodes.resize(V);
+  hg._hyperedges.clear();
+  hg._hyperedges.reserve(H);
+
+  for (Hypernode& hn : hg._hypernodes) hn.enable();
 
   const bool has_edge_weights = (type == mt_kahypar::Type::EdgeWeights || type == mt_kahypar::Type::EdgeAndNodeWeights);
   const bool has_node_weights = (type == mt_kahypar::Type::NodeWeights || type == mt_kahypar::Type::EdgeAndNodeWeights);
@@ -118,15 +135,11 @@ CompressedHypergraph CompressedHypergraphFactory::stream(const std::string& file
   std::string line;
   std::vector<size_t> nums;
 
-  // Build incident nets per node directly in compressed form using monotonic current_he_id
   std::vector<std::vector<uint8_t>> incident_nets(V);
-  std::vector<size_t> node_degree(V, 0);
-  std::vector<HyperedgeID> last_he_for_node(V, 0);
   size_t compressed_incident_nets_size = 0;
 
   HyperedgeID current_he_id = 0; //  == number of valid hyperedges after loop
   HyperedgeID removed_single_pin = 0;
-  std::vector<HyperedgeWeight> tmp_edge_weights; tmp_edge_weights.reserve(H);
 
   while (std::getline(in, line)) {
     ++current_line;
@@ -143,9 +156,7 @@ CompressedHypergraph CompressedHypergraphFactory::stream(const std::string& file
       continue;
     }
 
-  size_t start = hg._compressed_incidence_array.size();
-    // Write header varint for uncompressed edge size
-    push_varint(hg._compressed_incidence_array, nums.size());
+    size_t start = hg._compressed_incidence_array.size();
     size_t max_id = static_cast<size_t>(V);
     size_t prev = 0;
     for (size_t i = 0; i < nums.size(); ++i) {
@@ -155,17 +166,19 @@ CompressedHypergraph CompressedHypergraphFactory::stream(const std::string& file
       }
       size_t gap = cur - prev;
       push_varint(hg._compressed_incidence_array, gap);
-      const size_t net_gap = static_cast<size_t>(current_he_id - last_he_for_node[cur]);
+      size_t net_gap = current_he_id - get_last_varint(incident_nets[cur]);
       compressed_incident_nets_size += push_varint(incident_nets[cur], net_gap);
-      last_he_for_node[cur] = current_he_id;
-      node_degree[cur] += 1;
+      hg._hypernodes[cur].setUncompressedSize(hg._hypernodes[cur].size() + 1);
       prev = cur;
     }
-    // Record edge offset and enabled flag
-    hg._hyperedge_offsets.push_back(start);
-    hg._hyperedge_enabled.push_back(true);
-    // hyperedge weight into temporary vector (lazy assignment later)
-    if (has_edge_weights) tmp_edge_weights.push_back(static_cast<HyperedgeWeight>(he_weight));
+
+    hg._hyperedges.emplace_back();
+    auto& he = hg._hyperedges.back();
+    he.enable();
+    he.setFirstEntry(start);
+    he.setUncompressedSize(nums.size());
+    he.setCompressedSize(hg._compressed_incidence_array.size() - start);
+    if (has_edge_weights) he.setWeight(static_cast<HyperedgeWeight>(he_weight));
 
     hg._num_pins += static_cast<HypernodeID>(nums.size());
     if (nums.size() > static_cast<size_t>(hg._max_edge_size)) {
@@ -177,9 +190,6 @@ CompressedHypergraph CompressedHypergraphFactory::stream(const std::string& file
 
   hg._num_hyperedges = current_he_id;
   hg._num_removed_hyperedges = removed_single_pin;
-  if (has_edge_weights) {
-    hg._hyperedge_weights = std::move(tmp_edge_weights);
-  }
 
   // Read node weights if present (V weights as raw numbers possibly across lines)
   std::vector<HypernodeWeight> node_weights;
@@ -199,19 +209,18 @@ CompressedHypergraph CompressedHypergraphFactory::stream(const std::string& file
     }
   }
 
-  // combine all per-node compressed incident nets into CSR representation
+  // combine all incidence arrays into CSR representation
   hg._compressed_incident_nets.clear();
   hg._compressed_incident_nets.reserve(compressed_incident_nets_size);
 
   hg._total_degree = 0;
   hg._total_weight = 0;
-  for (size_t id = 0; id < incident_nets.size(); ++id) {
+   for (size_t id = 0; id < incident_nets.size(); ++id) {
     std::vector<uint8_t>& arr = incident_nets[id];
-    hg._total_degree += static_cast<HypernodeID>(node_degree[id]);
-    hg._hypernode_offsets[id] = hg._compressed_incident_nets.size();
-    // write header varint with node degree
-    push_varint(hg._compressed_incident_nets, node_degree[id]);
-    // then append encoded gaps
+    hg._total_degree += static_cast<HypernodeID>(arr.size());
+    Hypernode& hn = hg._hypernodes[id];
+    hn.setCompressedSize(arr.size());
+    hn.setFirstEntry(hg._compressed_incident_nets.size());
     hg._compressed_incident_nets.insert(
         hg._compressed_incident_nets.end(),
         std::make_move_iterator(arr.begin()),
@@ -221,8 +230,7 @@ CompressedHypergraph CompressedHypergraphFactory::stream(const std::string& file
 
     if (!has_node_weights) continue;
     HypernodeWeight w = node_weights[id];
-    if (hg._hypernode_weights.empty()) hg._hypernode_weights.assign(V, 1);
-    hg._hypernode_weights[id] = w;
+    hn.setWeight(w);
     hg._total_weight += w;
   }
   if (!has_node_weights) hg._total_weight = static_cast<HypernodeWeight>(V);
@@ -230,123 +238,4 @@ CompressedHypergraph CompressedHypergraphFactory::stream(const std::string& file
   hg._community_ids.assign(hg._num_hypernodes, 0);
   return hg;
   }
-
-CompressedHypergraph CompressedHypergraphFactory::construct(
-    const HypernodeID num_hypernodes,
-    const HyperedgeID /* num_hyperedges */, // derived from edge_vector.size()
-    const HyperedgeVector& edge_vector,
-    const HyperedgeWeight* hyperedge_weight,
-    const HypernodeWeight* hypernode_weight,
-    const bool /* stable_construction_of_incident_edges */) {
-
-  const HypernodeID V = num_hypernodes;
-  const HyperedgeID H = static_cast<HyperedgeID>(edge_vector.size());
-
-  CompressedHypergraph hg;
-
-  // Initialize sizes and counters
-  hg._num_hypernodes = V;
-  hg._num_hyperedges = H;
-  hg._num_removed_hyperedges = 0;
-  hg._max_edge_size = 0;
-  hg._num_pins = 0;
-  hg._total_degree = 0;
-  hg._total_weight = 0;
-
-  // Allocate CSR containers and enabled flags
-  hg._hypernode_offsets.assign(V, 0);
-  hg._hypernode_enabled.assign(V, true);
-  hg._hyperedge_offsets.assign(H, 0);
-  hg._hyperedge_enabled.assign(H, true);
-  hg._compressed_incidence_array.clear();
-  hg._compressed_incident_nets.clear();
-
-  // Build incident nets per node directly in compressed form (varint gap-encoded).
-  std::vector<std::vector<uint8_t>> incident_nets(V);
-  std::vector<size_t> node_degree(V, 0);
-  std::vector<HyperedgeID> last_he_for_node(V, 0);
-  size_t total_incident_bytes_est = 0;
-
-  // Encode edges' pin lists into one contiguous compressed buffer
-  size_t pins_bytes_offset = 0;
-  for (HyperedgeID he = 0; he < H; ++he) {
-    const auto& pins_in = edge_vector[he];
-
-    // Validate pins and prepare a sorted, deduplicated pin list (0-based IDs expected)
-    std::vector<HypernodeID> pins;
-    pins.reserve(pins_in.size());
-    for (HypernodeID v : pins_in) {
-      if (v >= V) {
-        throw InvalidInputException("Hypernode ID out of bounds in construct(): " + std::to_string(v));
-      }
-      pins.push_back(v);
-    }
-    std::sort(pins.begin(), pins.end());
-    pins.erase(std::unique(pins.begin(), pins.end()), pins.end());
-
-    // Set hyperedge offset
-    hg._hyperedge_offsets[he] = pins_bytes_offset;
-    // header varint for pins size
-    push_varint(hg._compressed_incidence_array, pins.size());
-    if (hyperedge_weight) {
-      if (hg._hyperedge_weights.empty()) hg._hyperedge_weights.assign(H, 1);
-      hg._hyperedge_weights[he] = hyperedge_weight[he];
-    }
-
-    // Varint gap-encode pins into incidence array
-    HypernodeID prev = 0;
-    for (HypernodeID v : pins) {
-      const uint64_t gap = static_cast<uint64_t>(v - prev);
-      encode_varint(gap, hg._compressed_incidence_array);
-      prev = v;
-      // Append compressed gap for incident net of node v (he is increasing)
-      const size_t net_gap = static_cast<size_t>(he - last_he_for_node[v]);
-      total_incident_bytes_est += push_varint(incident_nets[v], net_gap);
-      last_he_for_node[v] = he;
-      // Track degree counts
-      node_degree[v] += 1;
-    }
-    pins_bytes_offset = hg._compressed_incidence_array.size();
-
-    // Global counters
-    hg._num_pins += static_cast<HypernodeID>(pins.size());
-    if (pins.size() > static_cast<size_t>(hg._max_edge_size)) {
-      hg._max_edge_size = static_cast<HypernodeID>(pins.size());
-    }
-  }
-
-  // Combine per-node compressed sequences into CSR-like single array
-  hg._compressed_incident_nets.clear();
-  hg._compressed_incident_nets.reserve(total_incident_bytes_est);
-  for (HypernodeID u = 0; u < V; ++u) {
-    std::vector<uint8_t>& bytes = incident_nets[u];
-    // Start of this node's segment is current size
-    hg._hypernode_offsets[u] = hg._compressed_incident_nets.size();
-    // header varint for node degree
-    push_varint(hg._compressed_incident_nets, node_degree[u]);
-    // then the encoded gaps
-    hg._compressed_incident_nets.insert(
-      hg._compressed_incident_nets.end(),
-      std::make_move_iterator(bytes.begin()),
-      std::make_move_iterator(bytes.end())
-    );
-    hg._total_degree += static_cast<HypernodeID>(node_degree[u]);
-    bytes.clear();
-  }
-
-  // set lazy node weights if provided
-  if (hypernode_weight) {
-    hg._hypernode_weights.assign(V, 1);
-    for (HypernodeID u = 0; u < V; ++u) {
-      hg._hypernode_weights[u] = hypernode_weight[u];
-      hg._total_weight += hypernode_weight[u];
-    }
-  } else {
-    hg._total_weight = static_cast<HypernodeWeight>(V);
-  }
-
-  // Communities default to 0
-  hg._community_ids.assign(hg._num_hypernodes, 0);
-  return hg;
-}
 }

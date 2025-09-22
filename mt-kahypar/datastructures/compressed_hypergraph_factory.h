@@ -49,7 +49,10 @@ class CompressedHypergraphFactory {
                                     const HyperedgeVector& /* edge_vector */,
                                     const HyperedgeWeight* /* hyperedge_weight */ = nullptr,
                                     const HypernodeWeight* /* hypernode_weight */ = nullptr,
-                                    const bool /* stable_construction_of_incident_edges */ = false);
+                                    const bool /* stable_construction_of_incident_edges */ = false)  {
+    throw UnsupportedOperationException(
+      "Constrcut not implemented for compressed hypergraph. Stream from file instead.");
+  }
 
   static CompressedHypergraph stream(const std::string& filename,
   const bool remove_single_pin_hes);
