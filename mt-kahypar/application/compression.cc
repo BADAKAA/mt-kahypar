@@ -45,14 +45,22 @@ void append_csv_line(const std::string& csv_path, const std::string& filename,
             << (compressed ? "1" : "0") << std::endl;
 }
 
-void partition_graph(const std::string& filename, bool compressed, Context& context,
-                     const std::string& OUTPUT_PATH) {
-		context.partition.verbose_output = false;
+void partition_graph(const std::string& filename, const Context& base_context,
+                     const std::string& OUTPUT_PATH, bool compressed = false) {
+    // Make a fresh, per-run copy of the context
+    Context context = base_context;
+
+    // Ensure Context invariant before sanityCheck
+    if (!context.partition.use_individual_part_weights &&
+        !context.partition.max_part_weights.empty()) {
+      context.partition.max_part_weights.clear();
+    }
+
+    context.partition.verbose_output = false;
     context.partition.graph_filename = filename;
     context.partition.instance_type = compressed
                                           ? InstanceType::compressed_hypergraph
                                           : InstanceType::hypergraph;
-
     context.partition.partition_type = to_partition_c_type(
         context.partition.preset_type, context.partition.instance_type);
 
@@ -196,8 +204,8 @@ void print_progress(size_t current, size_t total) {
 }
 
 int main(int argc, char* argv[]) {
-    Context context(false);
-    processCommandLineInput(context, argc, argv, nullptr);
+    Context base(false);
+    processCommandLineInput(base, argc, argv, nullptr);
 
     fs::create_directories("./__out");
 
@@ -220,12 +228,19 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    std::cout << std::endl << "Partitioning Uncompressed Graphs" << std::endl;
     size_t count = 0;
+    print_progress(count, total);
     for (const auto& path : files) {
-        ++count;
-        partition_graph(path.string(), false, context, OUTPUT_PATH);
-        partition_graph(path.string(), true, context, OUTPUT_PATH);
-        print_progress(count, total);
+        partition_graph(path.string(), base, OUTPUT_PATH);
+        print_progress(++count, total);
+    }
+    std::cout << std::endl << "Partitioning Compressed Graphs" << std::endl;
+    count = 0;
+    print_progress(count, total);
+    for (const auto& path : files) {
+        partition_graph(path.string(), base, OUTPUT_PATH, true);
+        print_progress(++count, total);
     }
 
     std::cout << std::endl << "Processing complete." << std::endl;
