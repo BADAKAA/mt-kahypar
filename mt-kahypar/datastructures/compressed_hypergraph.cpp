@@ -336,7 +336,7 @@ namespace mt_kahypar::ds {
     }, [&] {
       hypergraph._compressed_incident_nets.resize(_compressed_incident_nets.size());
       memcpy(hypergraph._compressed_incident_nets.data(), _compressed_incident_nets.data(),
-             sizeof(HyperedgeID) * _compressed_incident_nets.size());
+             sizeof(uint8_t) * _compressed_incident_nets.size());
     }, [&] {
       hypergraph._hyperedges.resize(_hyperedges.size());
       memcpy(hypergraph._hyperedges.data(), _hyperedges.data(),
@@ -344,7 +344,7 @@ namespace mt_kahypar::ds {
     }, [&] {
       hypergraph._compressed_incidence_array.resize(_compressed_incidence_array.size());
       memcpy(hypergraph._compressed_incidence_array.data(), _compressed_incidence_array.data(),
-             sizeof(HypernodeID) * _compressed_incidence_array.size());
+             sizeof(uint8_t) * _compressed_incidence_array.size());
     }, [&] {
       hypergraph._community_ids = _community_ids;
     }, [&] {
@@ -369,16 +369,20 @@ namespace mt_kahypar::ds {
     hypergraph._hypernodes.resize(_hypernodes.size());
     memcpy(hypergraph._hypernodes.data(), _hypernodes.data(),
            sizeof(Hypernode) * _hypernodes.size());
+
     hypergraph._compressed_incident_nets.resize(_compressed_incident_nets.size());
+    // FIX: copy bytes
     memcpy(hypergraph._compressed_incident_nets.data(), _compressed_incident_nets.data(),
-           sizeof(HyperedgeID) * _compressed_incident_nets.size());
+           sizeof(uint8_t) * _compressed_incident_nets.size());
 
     hypergraph._hyperedges.resize(_hyperedges.size());
     memcpy(hypergraph._hyperedges.data(), _hyperedges.data(),
            sizeof(Hyperedge) * _hyperedges.size());
+
     hypergraph._compressed_incidence_array.resize(_compressed_incidence_array.size());
+    // FIX: copy bytes
     memcpy(hypergraph._compressed_incidence_array.data(), _compressed_incidence_array.data(),
-           sizeof(HypernodeID) * _compressed_incidence_array.size());
+           sizeof(uint8_t) * _compressed_incidence_array.size());
 
     hypergraph._community_ids = _community_ids;
     hypergraph.addFixedVertexSupport(_fixed_vertices.copy());
@@ -389,9 +393,11 @@ namespace mt_kahypar::ds {
   void CompressedHypergraph::memoryConsumption(utils::MemoryTreeNode* parent) const {
     ASSERT(parent);
     parent->addChild("Hypernodes", sizeof(Hypernode) * _hypernodes.size());
-    parent->addChild("Incident Nets", sizeof(HyperedgeID) * _compressed_incident_nets.size());
+    // FIX: account in bytes
+    parent->addChild("Incident Nets", sizeof(uint8_t) * _compressed_incident_nets.size());
     parent->addChild("Hyperedges", sizeof(Hyperedge) * _hyperedges.size());
-    parent->addChild("Incidence Array", sizeof(HypernodeID) * _compressed_incidence_array.size());
+    // FIX: account in bytes
+    parent->addChild("Incidence Array", sizeof(uint8_t) * _compressed_incidence_array.size());
     parent->addChild("Communities", sizeof(PartitionID) * _community_ids.capacity());
     if ( hasFixedVertices() ) {
       parent->addChild("Fixed Vertex Support", _fixed_vertices.size_in_bytes());
