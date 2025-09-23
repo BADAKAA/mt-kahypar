@@ -43,6 +43,7 @@
 #include "mt-kahypar/datastructures/static_hypergraph.h"
 #include "mt-kahypar/datastructures/static_hypergraph_factory.h"
 #include "mt-kahypar/datastructures/compressed_hypergraph.h"
+#include "mt-kahypar/datastructures/compressed_hypergraph_factory.h"
 #include "mt-kahypar/datastructures/partitioned_hypergraph.h"
 #include "mt-kahypar/datastructures/delta_partitioned_hypergraph.h"
 
@@ -85,7 +86,8 @@ struct LargeKHypergraphTypeTraits : public kahypar::meta::PolicyBase {
   using PartitionedHypergraph = StaticSparsePartitionedHypergraph;
 };
 
-using TypeTraitsList = kahypar::meta::Typelist<StaticHypergraphTypeTraits
+using TypeTraitsList = kahypar::meta::Typelist<StaticHypergraphTypeTraits,
+                                               CompressedHypergraphTypeTraits
                                                ENABLE_GRAPHS(COMMA StaticGraphTypeTraits)
                                                ENABLE_HIGHEST_QUALITY(COMMA DynamicHypergraphTypeTraits)
                                                ENABLE_HIGHEST_QUALITY_FOR_GRAPHS(COMMA DynamicGraphTypeTraits)
@@ -93,35 +95,40 @@ using TypeTraitsList = kahypar::meta::Typelist<StaticHypergraphTypeTraits
 
 #define INSTANTIATE_FUNC_WITH_HYPERGRAPHS(FUNC)                      \
   template FUNC(ds::StaticHypergraph);                               \
+  template FUNC(ds::CompressedHypergraph);                           \
   ENABLE_GRAPHS(template FUNC(ds::StaticGraph);)                     \
-  ENABLE_HIGHEST_QUALITY(template FUNC(ds::DynamicHypergraph);)       \
+  ENABLE_HIGHEST_QUALITY(template FUNC(ds::DynamicHypergraph);)      \
   ENABLE_HIGHEST_QUALITY_FOR_GRAPHS(template FUNC(ds::DynamicGraph);)
 
-#define INSTANTIATE_CLASS_WITH_HYPERGRAPHS(C)                           \
-  template class C<ds::StaticHypergraph>;                               \
-  ENABLE_GRAPHS(template class C<ds::StaticGraph>;)                     \
-  ENABLE_HIGHEST_QUALITY(template class C<ds::DynamicHypergraph>;)       \
+#define INSTANTIATE_CLASS_WITH_HYPERGRAPHS(C)                        \
+  template class C<ds::StaticHypergraph>;                            \
+  template class C<ds::CompressedHypergraph>;                        \
+  ENABLE_GRAPHS(template class C<ds::StaticGraph>;)                  \
+  ENABLE_HIGHEST_QUALITY(template class C<ds::DynamicHypergraph>;)   \
   ENABLE_HIGHEST_QUALITY_FOR_GRAPHS(template class C<ds::DynamicGraph>;)
 
 #define INSTANTIATE_FUNC_WITH_PARTITIONED_HG(FUNC)                           \
   template FUNC(StaticPartitionedHypergraph);                                \
+  template FUNC(CompressedPartitionedHypergraph);                            \
   ENABLE_GRAPHS(template FUNC(StaticPartitionedGraph);)                      \
   ENABLE_LARGE_K(template FUNC(StaticSparsePartitionedHypergraph);)          \
-  ENABLE_HIGHEST_QUALITY(template FUNC(DynamicPartitionedHypergraph);)        \
+  ENABLE_HIGHEST_QUALITY(template FUNC(DynamicPartitionedHypergraph);)       \
   ENABLE_HIGHEST_QUALITY_FOR_GRAPHS(template FUNC(DynamicPartitionedGraph);)
 
-#define INSTANTIATE_CLASS_WITH_PARTITIONED_HG(C)                                \
-  template class C<StaticPartitionedHypergraph>;                                \
-  ENABLE_GRAPHS(template class C<StaticPartitionedGraph>;)                      \
-  ENABLE_LARGE_K(template class C<StaticSparsePartitionedHypergraph>;)          \
-  ENABLE_HIGHEST_QUALITY(template class C<DynamicPartitionedHypergraph>;)        \
+#define INSTANTIATE_CLASS_WITH_PARTITIONED_HG(C)                             \
+  template class C<StaticPartitionedHypergraph>;                             \
+  template class C<CompressedPartitionedHypergraph>;                         \
+  ENABLE_GRAPHS(template class C<StaticPartitionedGraph>;)                   \
+  ENABLE_LARGE_K(template class C<StaticSparsePartitionedHypergraph>;)       \
+  ENABLE_HIGHEST_QUALITY(template class C<DynamicPartitionedHypergraph>;)    \
   ENABLE_HIGHEST_QUALITY_FOR_GRAPHS(template class C<DynamicPartitionedGraph>;)
 
-#define INSTANTIATE_CLASS_WITH_TYPE_TRAITS(C)                                   \
-  template class C<StaticHypergraphTypeTraits>;                                 \
-  ENABLE_GRAPHS(template class C<StaticGraphTypeTraits>;)                       \
-  ENABLE_HIGHEST_QUALITY(template class C<DynamicHypergraphTypeTraits>;)         \
-  ENABLE_HIGHEST_QUALITY_FOR_GRAPHS(template class C<DynamicGraphTypeTraits>;)   \
+#define INSTANTIATE_CLASS_WITH_TYPE_TRAITS(C)                                \
+  template class C<StaticHypergraphTypeTraits>;                              \
+  template class C<CompressedHypergraphTypeTraits>;                          \
+  ENABLE_GRAPHS(template class C<StaticGraphTypeTraits>;)                    \
+  ENABLE_HIGHEST_QUALITY(template class C<DynamicHypergraphTypeTraits>;)     \
+  ENABLE_HIGHEST_QUALITY_FOR_GRAPHS(template class C<DynamicGraphTypeTraits>;)\
   ENABLE_LARGE_K(template class C<LargeKHypergraphTypeTraits>;)
 
 

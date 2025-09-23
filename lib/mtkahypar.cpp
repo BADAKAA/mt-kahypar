@@ -59,6 +59,7 @@ namespace {
   using DynamicGraphFactory = typename ds::DynamicGraph::Factory;
 
   using StaticPartitionedHypergraph = typename StaticHypergraphTypeTraits::PartitionedHypergraph;
+  using CompressedPartitionedHypergraph = typename CompressedHypergraphTypeTraits::PartitionedHypergraph;
   using DynamicPartitionedHypergraph = typename DynamicHypergraphTypeTraits::PartitionedHypergraph;
   using SparsePartitionedHypergraph = typename LargeKHypergraphTypeTraits::PartitionedHypergraph;
   using StaticPartitionedGraph = typename StaticGraphTypeTraits::PartitionedHypergraph;

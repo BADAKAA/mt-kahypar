@@ -119,7 +119,8 @@ bool is_compatible(mt_kahypar_partitioned_hypergraph_t partitioned_hg, mt_kahypa
     case QUALITY:
     case DETERMINISTIC:
       return partitioned_hg.type == MULTILEVEL_GRAPH_PARTITIONING ||
-             partitioned_hg.type == MULTILEVEL_HYPERGRAPH_PARTITIONING;
+             partitioned_hg.type == MULTILEVEL_HYPERGRAPH_PARTITIONING ||
+             partitioned_hg.type == COMPRESSED_MULTILEVEL_HYPERGRAPH_PARTITIONING;
     case LARGE_K:
       return partitioned_hg.type == MULTILEVEL_GRAPH_PARTITIONING ||
              partitioned_hg.type == LARGE_K_PARTITIONING;
@@ -195,6 +196,8 @@ InstanceType get_instance_type(mt_kahypar_partitioned_hypergraph_t partitioned_h
     case MULTILEVEL_GRAPH_PARTITIONING:
     case N_LEVEL_GRAPH_PARTITIONING:
       return InstanceType::graph;
+    case COMPRESSED_MULTILEVEL_HYPERGRAPH_PARTITIONING:
+      return InstanceType::compressed_hypergraph;
     case MULTILEVEL_HYPERGRAPH_PARTITIONING:
     case N_LEVEL_HYPERGRAPH_PARTITIONING:
     case LARGE_K_PARTITIONING:
@@ -265,6 +268,7 @@ std::string incompatibility_description(mt_kahypar_partitioned_hypergraph_t part
       ss << "The partitioned hypergraph uses the data structures for n-level graph partitioning "
          << "which can be only used in combination with the following preset: "
          << "HIGHEST_QUALITY"; break;
+    case COMPRESSED_MULTILEVEL_HYPERGRAPH_PARTITIONING:
     case MULTILEVEL_HYPERGRAPH_PARTITIONING:
       ss << "The partitioned hypergraph uses the data structures for multilevel hypergraph partitioning "
          << "which can be only used in combination with the following presets: "

@@ -82,6 +82,7 @@ namespace mt_kahypar {
       case MULTILEVEL_GRAPH_PARTITIONING: return os << "multilevel_graph_partitioning";
       case N_LEVEL_GRAPH_PARTITIONING: return os << "n_level_graph_partitioning";
       case MULTILEVEL_HYPERGRAPH_PARTITIONING: return os << "multilevel_hypergraph_partitioning";
+      case COMPRESSED_MULTILEVEL_HYPERGRAPH_PARTITIONING: return os << "compressed_multilevel_hypergraph_partitioning";
       case LARGE_K_PARTITIONING: return os << "large_k_partitioning";
       case N_LEVEL_HYPERGRAPH_PARTITIONING: return os << "n_level_hypergraph_partitioning";
       case NULLPTR_PARTITION: return os << "UNDEFINED";

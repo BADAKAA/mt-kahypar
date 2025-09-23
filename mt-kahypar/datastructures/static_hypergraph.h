@@ -940,7 +940,13 @@ class StaticHypergraph {
   MT_KAHYPAR_ATTRIBUTE_ALWAYS_INLINE Hyperedge& hyperedge(const HyperedgeID e) {
     return const_cast<Hyperedge&>(static_cast<const StaticHypergraph&>(*this).hyperedge(e));
   }
-
+  
+  MT_KAHYPAR_ATTRIBUTE_ALWAYS_INLINE HypernodeID pinAt(const HyperedgeID e, const size_t local_pos) const {
+    ASSERT(!hyperedge(e).isDisabled(), "Hyperedge" << e << "is disabled");
+    ASSERT(local_pos < edgeSize(e));
+    const size_t pos = hyperedge(e).firstEntry() + local_pos;
+    return _incidence_array[pos];
+  }
   // ####################### Remove / Restore Hyperedges #######################
 
   // ! Removes hyperedge e from the incident nets of vertex hn
