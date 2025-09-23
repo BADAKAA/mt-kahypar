@@ -1291,7 +1291,10 @@ private:
    MT_KAHYPAR_ATTRIBUTE_ALWAYS_INLINE IteratorRange<IncidentNetsIterator>
    incident_nets_of(const HypernodeID u, const size_t pos = 0) const {
        ASSERT(!hypernode(u).isDisabled(), "Hypernode" << u << "is disabled");
-       ASSERT(pos == 0, "incident_nets_of(u, pos) with pos > 0 is not supported in compressed hypergraph");
+       if (pos != 0) {
+           throw UnsupportedOperationException(
+               "incident_nets_of(u, pos) with pos > 0 is not supported in compressed hypergraph");
+        }
        const Hypernode& hn = hypernode(u);
        return IteratorRange<IncidentNetsIterator>(
            IncidentNetsIterator(_compressed_incident_nets, hn.firstEntry(), hn.firstInvalidEntry(), _num_hyperedges),

@@ -24,7 +24,8 @@ static inline size_t parseRawNumbers(const std::string& line, std::vector<size_t
   out.clear();
   const char* ptr = line.c_str();
   const char* end = ptr + line.size();
-  size_t first;
+  size_t first = 0;
+  bool first_extracted = !exclude_first;
   while (ptr < end) {
     while (ptr < end && (is_space(*ptr) || *ptr == ',')) ++ptr;
     if (ptr >= end) break;
@@ -34,13 +35,14 @@ static inline size_t parseRawNumbers(const std::string& line, std::vector<size_t
     if (ec != std::errc()) {
       throw InvalidInputException("Invalid number in input line: " + (line.size() <= 40 ? line : line.substr(0, 40) + "..."));
     }
-    if (exclude_first) {
+    if (!first_extracted) {
       first = v;
-      exclude_first = false;
+      first_extracted = true;
       continue;
     } 
     out.push_back(v);
   }
+  if (!first_extracted) throw InvalidInputException("Expected first value in input line but found none");
   return first;
 }
 
