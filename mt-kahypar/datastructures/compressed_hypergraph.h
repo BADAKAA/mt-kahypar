@@ -43,6 +43,7 @@
 #include "mt-kahypar/utils/range.h"
 #include "mt-kahypar/utils/exception.h"
 #include "mt-kahypar/parallel/stl/scalable_vector.h"
+#include "mt-kahypar/datastructures/bit_vector.h"
 
 namespace mt_kahypar {
 namespace ds {
@@ -87,6 +88,48 @@ inline uint64_t decode_varint_bounded(const std::vector<uint8_t>& in, size_t& po
   return result;
 }
 
+// Encode an unsigned LEB128 (varint) of a fixed total length (>= minimal).
+// If fixed_len equals the minimal length, this produces the canonical encoding.
+// If fixed_len is larger, we extend the encoding by appending zero-groups at the
+// most-significant end (keeping group alignment) which still decodes to the same value.
+// This allows in-place updates without shifting following bytes.
+inline void encode_varint_fixed_len(uint64_t value, size_t fixed_len, std::vector<uint8_t>& out_bytes) {
+    out_bytes.clear();
+    // First, generate minimal bytes
+    std::vector<uint8_t> tmp;
+    encode_varint(value, tmp);
+    if (fixed_len < tmp.size()) {
+        throw UnsupportedOperationException("encode_varint_fixed_len: fixed_len too small for value");
+    }
+    if (fixed_len == tmp.size()) {
+        out_bytes = std::move(tmp);
+        return;
+    }
+    // Extend by converting the last byte to continuation and appending zero groups
+    // until we reach fixed_len - 1, then a final stop byte 0x00.
+    // Example: value=1 (0x01) to len=2 -> [0x81, 0x00]
+    //          value=300 (0xAC 0x02) to len=4 -> [0xAC|0x80, 0x02|0x80, 0x80, 0x00]
+    std::vector<uint8_t> extended;
+    // Copy all but last minimal byte as-is
+    if (!tmp.empty()) {
+        for (size_t i = 0; i + 1 < tmp.size(); ++i) {
+            // ensure continuation bit set for all non-final groups
+            extended.push_back(tmp[i] | 0x80u);
+        }
+        // Last minimal byte becomes continuation as well (unless minimal was already multiple bytes where its MSB may already be 0)
+        extended.push_back(tmp.back() | 0x80u);
+    } else {
+        // value == 0 minimal representation empty should not happen (encode_varint always emits at least one byte)
+        extended.push_back(0x80u);
+    }
+    // Append (fixed_len - minimal_len - 1) zero continuation groups
+    const size_t extra_groups = fixed_len - tmp.size() - 1;
+    for (size_t i = 0; i < extra_groups; ++i) extended.push_back(0x80u);
+    // Final stop byte with zero payload
+    extended.push_back(0x00u);
+    out_bytes = std::move(extended);
+}
+
 // Sort and deduplicate before gap encoding to guarantee a monotone sequence
 inline void append_compressed_sequence(const std::vector<HypernodeID> &sequence, std::vector<uint8_t> &target) {
   if (sequence.empty()) return;
@@ -119,207 +162,57 @@ class CompressedHypergraph {
 
 #define NOOP_BATCH_FUNC [] (const HypernodeID, const HypernodeID, const HyperedgeID) { }
 
-    /**
-     * Represents a hypernode with compressed incident nets storage
-     */
+    // Proxy for a hypernode backed by parent offsets/enabled arrays
     class Hypernode {
     public:
         using IDType = HypernodeID;
+        Hypernode() : _hg(nullptr), _id(0) {}
+        Hypernode(const CompressedHypergraph* hg, HypernodeID id) : _hg(hg), _id(id) {}
 
-        Hypernode() :
-            _begin(0),
-            _compressed_size(0),
-            _uncompressed_size(0),
-            _weight(1),
-            _valid(false) { }
+    bool isDisabled() const { return !_hg || !_hg->_hypernode_enabled[_id]; }
+    void enable() const { ASSERT(_hg); const_cast<CompressedHypergraph*>(_hg)->_hypernode_enabled[_id] = true; }
+    void disable() const { ASSERT(_hg); const_cast<CompressedHypergraph*>(_hg)->_hypernode_enabled[_id] = false; }
 
-        Hypernode(const bool valid) :
-            _begin(0),
-            _compressed_size(0),
-            _uncompressed_size(0),
-            _weight(1),
-            _valid(valid) { }
+        size_t firstEntry() const { return _hg->_hypernode_offsets[_id]; }
+        void setFirstEntry(const size_t begin) const { ASSERT(!isDisabled()); const_cast<CompressedHypergraph*>(_hg)->_hypernode_offsets[_id] = begin; }
 
-        // Sentinel Constructor
-        Hypernode(const size_t begin) :
-            _begin(begin),
-            _compressed_size(0),
-            _uncompressed_size(0),
-            _weight(1),
-            _valid(false) { }
-
-        bool isDisabled() const {
-            return _valid == false;
-        }
-
-        void enable() {
-            ASSERT(isDisabled());
-            _valid = true;
-        }
-
-        void disable() {
-            ASSERT(!isDisabled());
-            _valid = false;
-        }
-
-        // Returns the index of the first element in compressed incident nets
-        size_t firstEntry() const {
-            return _begin;
-        }
-
-        // Sets the index of the first element in compressed incident nets
-        void setFirstEntry(size_t begin) {
-            ASSERT(!isDisabled());
-            _begin = begin;
-        }
-
-        // Returns the index after the last element in compressed incident nets
-        size_t firstInvalidEntry() const {
-            return _begin + _compressed_size;
-        }
-
-        // Returns the compressed size in bytes
-        size_t compressedSize() const {
-            ASSERT(!isDisabled());
-            return _compressed_size;
-        }
-
-        // Sets the compressed size in bytes
-        void setCompressedSize(size_t size) {
-            ASSERT(!isDisabled());
-            _compressed_size = size;
-        }
-
-        // Returns the uncompressed size (number of incident nets)
-        size_t size() const {
-            ASSERT(!isDisabled());
-            return _uncompressed_size;
-        }
-
-        // Sets the uncompressed size (number of incident nets)
-        void setUncompressedSize(size_t size) {
-            ASSERT(!isDisabled());
-            _uncompressed_size = size;
-        }
-
-        HypernodeWeight weight() const {
-            return _weight;
-        }
-
-        void setWeight(HypernodeWeight weight) {
-            ASSERT(!isDisabled());
-            _weight = weight;
-        }
+        size_t firstInvalidEntry() const { return _hg->hypernode_firstInvalidEntry(_id); }
+        HyperedgeID degree() const { return _hg->nodeDegree(_id); }
+        HypernodeWeight weight() const { return _hg->nodeWeight(_id); }
+        void setWeight(HypernodeWeight w) const { const_cast<CompressedHypergraph*>(_hg)->setNodeWeight(_id, w); }
+        HypernodeID id() const { return _id; }
 
     private:
-        size_t _begin;                  // Index in compressed incident nets array
-        size_t _compressed_size;        // Size in compressed array (bytes)
-        size_t _uncompressed_size;      // Number of incident nets when decompressed
-        HypernodeWeight _weight;        // Hypernode weight
-        bool _valid;                    // Flag indicating whether the element is active
+        const CompressedHypergraph* _hg;
+        HypernodeID _id;
     };
 
-    /**
-     * Represents a hyperedge with compressed pins storage
-     */
+    // Proxy for a hyperedge
     class Hyperedge {
     public:
         using IDType = HyperedgeID;
+        Hyperedge() : _hg(nullptr), _id(0) {}
+        Hyperedge(const CompressedHypergraph* hg, HyperedgeID id) : _hg(hg), _id(id) {}
 
-        Hyperedge() :
-            _begin(0),
-            _compressed_size(0),
-            _uncompressed_size(0),
-            _weight(1),
-            _valid(false) { }
+    bool isDisabled() const { return !_hg || !_hg->_hyperedge_enabled[_id]; }
+    void enable() const { ASSERT(_hg); const_cast<CompressedHypergraph*>(_hg)->_hyperedge_enabled[_id] = true; }
+    void disable() const { ASSERT(_hg); const_cast<CompressedHypergraph*>(_hg)->_hyperedge_enabled[_id] = false; }
 
-        // Sentinel Constructor
-        Hyperedge(const size_t begin) :
-            _begin(begin),
-            _compressed_size(0),
-            _uncompressed_size(0),
-            _weight(1),
-            _valid(false) { }
+        size_t firstEntry() const { return _hg->_hyperedge_offsets[_id]; }
+        void setFirstEntry(const size_t begin) const { ASSERT(!isDisabled()); const_cast<CompressedHypergraph*>(_hg)->_hyperedge_offsets[_id] = begin; }
 
-        void disable() {
-            ASSERT(!isDisabled());
-            _valid = false;
-        }
+        size_t firstInvalidEntry() const { return _hg->hyperedge_firstInvalidEntry(_id); }
+        HypernodeID size() const { return _hg->edgeSize(_id); }
+        HyperedgeWeight weight() const { return _hg->edgeWeight(_id); }
+        void setWeight(HyperedgeWeight w) const { const_cast<CompressedHypergraph*>(_hg)->setEdgeWeight(_id, w); }
+        HyperedgeID id() const { return _id; }
 
-        void enable() {
-            ASSERT(isDisabled());
-            _valid = true;
-        }
-
-        bool isDisabled() const {
-            return _valid == false;
-        }
-
-        // Returns the index of the first element in compressed incidence array
-        size_t firstEntry() const {
-            return _begin;
-        }
-
-        // Sets the index of the first element in compressed incidence array
-        void setFirstEntry(size_t begin) {
-            ASSERT(!isDisabled());
-            _begin = begin;
-        }
-
-        // Returns the index after the last element in compressed incidence array
-        size_t firstInvalidEntry() const {
-            return _begin + _compressed_size;
-        }
-
-        // Returns the compressed size in bytes
-        size_t compressedSize() const {
-            ASSERT(!isDisabled());
-            return _compressed_size;
-        }
-
-        // Sets the compressed size in bytes
-        void setCompressedSize(size_t size) {
-            ASSERT(!isDisabled());
-            _compressed_size = size;
-        }
-
-        // Returns the uncompressed size (number of pins)
-        size_t size() const {
-            ASSERT(!isDisabled());
-            return _uncompressed_size;
-        }
-
-        // Sets the uncompressed size (number of pins)
-        void setUncompressedSize(size_t size) {
-            ASSERT(!isDisabled());
-            _uncompressed_size = size;
-        }
-
-        HyperedgeWeight weight() const {
-            ASSERT(!isDisabled());
-            return _weight;
-        }
-
-        void setWeight(HyperedgeWeight weight) {
-            ASSERT(!isDisabled());
-            _weight = weight;
-        }
-
-        bool operator== (const Hyperedge& other) const {
-            return _begin == other._begin && _compressed_size == other._compressed_size && 
-                   _uncompressed_size == other._uncompressed_size && _weight == other._weight;
-        }
-
-        bool operator!= (const Hyperedge& other) const {
-            return !(*this == other);
-        }
+        bool operator==(const Hyperedge& other) const { return _hg == other._hg && _id == other._id; }
+        bool operator!=(const Hyperedge& other) const { return !(*this == other); }
 
     private:
-        size_t _begin;                  // Index in compressed incidence array
-        size_t _compressed_size;        // Length in compressed array
-        size_t _uncompressed_size;      // Number of pins when decompressed
-        HyperedgeWeight _weight;        // Hyperedge weight
-        bool _valid;                    // Flag indicating whether the element is active
+        const CompressedHypergraph* _hg;
+        HyperedgeID _id;
     };
 
     /**
@@ -407,63 +300,42 @@ class CompressedHypergraph {
         bool _has_value;
     };
 
-    /**
-     * Regular element iterator (for nodes/edges)
-     */
-    template<typename ElementType>
-    class HypergraphElementIterator {
+    // Iterators over IDs using enabled flags
+    template <typename ID>
+    class IDIterator {
     public:
-        using IDType = typename ElementType::IDType;
         using iterator_category = std::forward_iterator_tag;
-        using value_type = IDType;
-        using reference = IDType&;
-        using pointer = const IDType*;
+        using value_type = ID;
+        using reference = ID;
+        using pointer = void;
         using difference_type = std::ptrdiff_t;
 
-        HypergraphElementIterator(const ElementType* start_element, IDType id, IDType max_id) :
-            _id(id),
-            _max_id(max_id),
-            _element(start_element) {
-            if (_id != _max_id && _element->isDisabled()) {
-                operator++();
-            }
+        IDIterator(const CompressedHypergraph* hg, ID id, ID max, bool edge) :
+            _hg(hg), _id(id), _max(max), _edge(edge) {
+            if (_id != _max && !isEnabled(_id)) ++(*this);
         }
 
-        IDType operator*() const {
-            return _id;
-        }
+        ID operator*() const { return _id; }
 
-        HypergraphElementIterator& operator++() {
-            ASSERT(_id < _max_id);
-            do {
-                ++_id;
-                ++_element;
-            } while (_id < _max_id && _element->isDisabled());
+        IDIterator& operator++() {
+            do { ++_id; } while (_id < _max && !isEnabled(_id));
             return *this;
         }
 
-        HypergraphElementIterator operator++(int) {
-            HypergraphElementIterator copy = *this;
-            operator++();
-            return copy;
-        }
-
-        bool operator!=(const HypergraphElementIterator& rhs) {
-            return _id != rhs._id;
-        }
-
-        bool operator==(const HypergraphElementIterator& rhs) {
-            return _id == rhs._id;
-        }
+        IDIterator operator++(int) { auto c = *this; ++(*this); return c; }
+        bool operator!=(const IDIterator& rhs) const { return _id != rhs._id; }
+        bool operator==(const IDIterator& rhs) const { return _id == rhs._id; }
 
     private:
-        IDType _id = 0;
-        IDType _max_id = 0;
-        const ElementType* _element = nullptr;
+        bool isEnabled(ID x) const {
+            return _edge ? _hg->_hyperedge_enabled[x]
+                         : _hg->_hypernode_enabled[x];
+        }
+        const CompressedHypergraph* _hg;
+        ID _id;
+        ID _max;
+        bool _edge;
     };
-
-    static_assert(std::is_trivially_copyable<Hypernode>::value, "Hypernode is not trivially copyable");
-    static_assert(std::is_trivially_copyable<Hyperedge>::value, "Hyperedge is not trivially copyable");
 
     using CompressedIncidenceArray = std::vector<uint8_t>;    // Compressed pins storage
     using CompressedIncidentNets = std::vector<uint8_t>;      // Compressed incident nets storage
@@ -506,11 +378,61 @@ public:
     // Factory
     using Factory = CompressedHypergraphFactory;
 
-    // Iterator types
-    using HypernodeIterator = HypergraphElementIterator<Hypernode>;
-    using HyperedgeIterator = HypergraphElementIterator<Hyperedge>;
-    // Pins of a hyperedge are HypernodeID
-    using IncidenceIterator = CompressedIterator<HypernodeID>;
+    // Iterator types (ID-based over enabled flags)
+    // Note: legacy element iterator from other hypergraph variants is not used here
+        // Pins of a hyperedge are HypernodeID (degree-bounded, skip zero-gap placeholders)
+        class PinsIterator {
+        public:
+                using iterator_category = std::forward_iterator_tag;
+                using value_type = HypernodeID;
+                using reference = HypernodeID;
+                using pointer = const HypernodeID*;
+                using difference_type = std::ptrdiff_t;
+
+                PinsIterator(const std::vector<uint8_t>& data,
+                                         size_t start_pos,
+                                         size_t end_pos,
+                                         size_t remaining)
+                        : _data(data), _end(end_pos), _pos(start_pos), _acc(0), _cur(0), _has(false), _left(remaining), _emitted(0) {
+                    advance_to_valid();
+                }
+
+                PinsIterator(const std::vector<uint8_t>& data, size_t end_pos)
+                        : _data(data), _end(end_pos), _pos(end_pos), _acc(0), _cur(0), _has(false), _left(0), _emitted(0) {}
+
+                HypernodeID operator*() const { ASSERT(_has); return _cur; }
+                PinsIterator& operator++() { if (_has) advance_to_valid(); return *this; }
+                PinsIterator operator++(int) { auto c = *this; ++(*this); return c; }
+                bool operator!=(const PinsIterator& rhs) const { if (!_has && !rhs._has) return false; return _pos != rhs._pos || _end != rhs._end || _has != rhs._has || _left != rhs._left; }
+                bool operator==(const PinsIterator& rhs) const { return !(*this != rhs); }
+
+        private:
+                void advance_to_valid() {
+                    _has = false;
+                    while (_pos < _end && _left > 0) {
+                        const uint64_t gap = decode_varint_bounded(_data, _pos, _end);
+                        // skip zero-gap placeholders except possibly the very first emitted element
+                        if (_emitted > 0 && gap == 0) { continue; }
+                        _acc += static_cast<HypernodeID>(gap);
+                        _cur = _acc;
+                        --_left;
+                        ++_emitted;
+                        _has = true;
+                        return;
+                    }
+                    _has = false;
+                }
+
+                const std::vector<uint8_t>& _data;
+                size_t _end;
+                size_t _pos;
+                HypernodeID _acc;
+                HypernodeID _cur;
+                bool _has;
+                size_t _left;
+                size_t _emitted;
+        };
+        using IncidenceIterator = PinsIterator;
         // Incident nets of a hypernode are HyperedgeID
         // We wrap decoding with a filtering iterator to skip out-of-range IDs defensively.
         class IncidentNetsFilteringIterator {
@@ -524,9 +446,11 @@ public:
                 IncidentNetsFilteringIterator(const std::vector<uint8_t>& data,
                                                                             size_t start_pos,
                                                                             size_t end_pos,
-                                                                            HyperedgeID max_edge_id)
+                                                                            HyperedgeID max_edge_id,
+                                                                            const BitVector* enabled,
+                                                                            size_t remaining)
                     : _data(data), _end(end_pos), _pos(start_pos),
-                        _acc(0), _cur(0), _has(false), _max(max_edge_id) {
+                        _acc(0), _cur(0), _has(false), _max(max_edge_id), _enabled(enabled), _left(remaining), _emitted(0) {
                     advance_to_valid();
                 }
 
@@ -534,7 +458,7 @@ public:
                 IncidentNetsFilteringIterator(const std::vector<uint8_t>& data,
                                                                             size_t end_pos)
                     : _data(data), _end(end_pos), _pos(end_pos),
-                        _acc(0), _cur(0), _has(false), _max(0) { }
+                        _acc(0), _cur(0), _has(false), _max(0), _enabled(nullptr), _left(0), _emitted(0) { }
 
                 HyperedgeID operator*() const { ASSERT(_has); return _cur; }
 
@@ -550,14 +474,22 @@ public:
                 bool operator==(const IncidentNetsFilteringIterator& rhs) const { return !(*this != rhs); }
 
         private:
-                void advance_to_valid() {
+                                void advance_to_valid() {
                     _has = false;
-                    while (_pos < _end) {
+                                                            while (_pos < _end && _left > 0) {
                         const uint64_t gap = decode_varint_bounded(_data, _pos, _end);
-                        _acc += static_cast<HyperedgeID>(gap);
-                        if (_acc < _max) { _cur = _acc; _has = true; return; }
+                                                                    // skip zero-gap placeholders except possibly the very first emitted element
+                                                                    if (_emitted > 0 && gap == 0) { continue; }
+                                                                    _acc += static_cast<HyperedgeID>(gap);
+                                                                    // consume one logical entry regardless of enabled
+                                                                    --_left; ++_emitted;
+                                                                    if (_acc < _max && (_enabled == nullptr || (*_enabled)[_acc])) {
+                                                                        _cur = _acc; _has = true; return;
+                                                                    }
                         // else: skip invalid ID and continue
                     }
+                                        // exhausted
+                                        _has = false;
                 }
 
                 const std::vector<uint8_t>& _data;
@@ -566,7 +498,10 @@ public:
                 HyperedgeID _acc;
                 HyperedgeID _cur;
                 bool _has;
-                HyperedgeID _max;
+        HyperedgeID _max;
+        const BitVector* _enabled;
+        size_t _left;
+        size_t _emitted;
         };
 
         using IncidentNetsIterator = IncidentNetsFilteringIterator;
@@ -586,10 +521,14 @@ public:
         _num_pins(0),
         _total_degree(0),
         _total_weight(0),
-        _hypernodes(),
+        _hypernode_offsets(),
+        _hypernode_enabled(),
         _compressed_incident_nets(),
-        _hyperedges(),
+        _hyperedge_offsets(),
+        _hyperedge_enabled(),
         _compressed_incidence_array(),
+        _hypernode_weights(),
+        _hyperedge_weights(),
         _community_ids(0),
         _fixed_vertices(),
         _tmp_contraction_buffer(nullptr) { }
@@ -610,10 +549,14 @@ public:
         _num_pins(other._num_pins),
         _total_degree(other._total_degree),
         _total_weight(other._total_weight),
-        _hypernodes(std::move(other._hypernodes)),
+        _hypernode_offsets(std::move(other._hypernode_offsets)),
+        _hypernode_enabled(std::move(other._hypernode_enabled)),
         _compressed_incident_nets(std::move(other._compressed_incident_nets)),
-        _hyperedges(std::move(other._hyperedges)),
+        _hyperedge_offsets(std::move(other._hyperedge_offsets)),
+        _hyperedge_enabled(std::move(other._hyperedge_enabled)),
         _compressed_incidence_array(std::move(other._compressed_incidence_array)),
+        _hypernode_weights(std::move(other._hypernode_weights)),
+        _hyperedge_weights(std::move(other._hyperedge_weights)),
         _community_ids(std::move(other._community_ids)),
         _fixed_vertices(std::move(other._fixed_vertices)),
         _tmp_contraction_buffer(std::move(other._tmp_contraction_buffer)) {
@@ -632,10 +575,14 @@ public:
             _num_pins = other._num_pins;
             _total_degree = other._total_degree;
             _total_weight = other._total_weight;
-            _hypernodes = std::move(other._hypernodes);
+            _hypernode_offsets = std::move(other._hypernode_offsets);
+            _hypernode_enabled = std::move(other._hypernode_enabled);
             _compressed_incident_nets = std::move(other._compressed_incident_nets);
-            _hyperedges = std::move(other._hyperedges);
+            _hyperedge_offsets = std::move(other._hyperedge_offsets);
+            _hyperedge_enabled = std::move(other._hyperedge_enabled);
             _compressed_incidence_array = std::move(other._compressed_incidence_array);
+            _hypernode_weights = std::move(other._hypernode_weights);
+            _hyperedge_weights = std::move(other._hyperedge_weights);
             _community_ids = std::move(other._community_ids);
             _fixed_vertices = std::move(other._fixed_vertices);
             _fixed_vertices.setHypergraph(this);
@@ -712,61 +659,113 @@ public:
         }
     }
 
+    using HypernodeIterator = IDIterator<HypernodeID>;
+    using HyperedgeIterator = IDIterator<HyperedgeID>;
+
     IteratorRange<HypernodeIterator> nodes() const {
         return IteratorRange<HypernodeIterator>(
-            HypernodeIterator(_hypernodes.data(), ID(0), _num_hypernodes),
-            HypernodeIterator(_hypernodes.data() + _num_hypernodes, _num_hypernodes, _num_hypernodes));
+            HypernodeIterator(this, ID(0), _num_hypernodes, /*edge*/false),
+            HypernodeIterator(this, _num_hypernodes, _num_hypernodes, /*edge*/false));
     }
 
     IteratorRange<HyperedgeIterator> edges() const {
         return IteratorRange<HyperedgeIterator>(
-            HyperedgeIterator(_hyperedges.data(), ID(0), _num_hyperedges),
-            HyperedgeIterator(_hyperedges.data() + _num_hyperedges, _num_hyperedges, _num_hyperedges));
+            HyperedgeIterator(this, ID(0), _num_hyperedges, /*edge*/true),
+            HyperedgeIterator(this, _num_hyperedges, _num_hyperedges, /*edge*/true));
     }
 
     IteratorRange<IncidentNetsIterator> incidentEdges(const HypernodeID u) const {
-        ASSERT(!hypernode(u).isDisabled(), "Hypernode" << u << "is disabled");
-        const Hypernode& hn = hypernode(u);
+        ASSERT(nodeIsEnabled(u), "Hypernode" << u << "is disabled");
+           const size_t begin = _hypernode_offsets[u];
+           const size_t end = hypernode_firstInvalidEntry(u);
+        size_t pos = begin;
+        // read header varint (uncompressed degree)
+        const size_t deg = static_cast<size_t>(decode_varint_bounded(_compressed_incident_nets, pos, end));
         return IteratorRange<IncidentNetsIterator>(
-            IncidentNetsIterator(_compressed_incident_nets, hn.firstEntry(), hn.firstInvalidEntry(), _num_hyperedges),
-            IncidentNetsIterator(_compressed_incident_nets, hn.firstInvalidEntry()));
+            IncidentNetsIterator(_compressed_incident_nets, pos, end, _num_hyperedges, &_hyperedge_enabled, deg),
+            IncidentNetsIterator(_compressed_incident_nets, end));
     }
 
     IteratorRange<IncidenceIterator> pins(const HyperedgeID e) const {
-        ASSERT(!hyperedge(e).isDisabled(), "Hyperedge" << e << "is disabled");
-        const Hyperedge& he = hyperedge(e);
+        ASSERT(edgeIsEnabled(e), "Hyperedge" << e << "is disabled");
+        const size_t he_begin = _hyperedge_offsets[e];
+        const size_t he_end = hyperedge_firstInvalidEntry(e);
+        size_t pos = he_begin;
+        // read header varint (uncompressed size)
+        const size_t esize = static_cast<size_t>(decode_varint_bounded(_compressed_incidence_array, pos, he_end));
         return IteratorRange<IncidenceIterator>(
-            IncidenceIterator(_compressed_incidence_array, he.firstEntry(), he.firstInvalidEntry()),
-            IncidenceIterator(_compressed_incidence_array, he.firstInvalidEntry()));
+            IncidenceIterator(_compressed_incidence_array, pos, he_end, esize),
+            IncidenceIterator(_compressed_incidence_array, he_end));
+    }
+
+    // Expose compressed sizes (in bytes) of segments; uses trailing-zero trimming
+    size_t compressedSizeOfEdge(const HyperedgeID e) const {
+        const size_t begin = _hyperedge_offsets[e];
+        const size_t end = hyperedge_firstInvalidEntry(e);
+        return end - begin;
+    }
+
+    size_t compressedSizeOfNode(const HypernodeID u) const {
+        const size_t begin = _hypernode_offsets[u];
+        const size_t end = hypernode_firstInvalidEntry(u);
+        return end - begin;
+    }
+
+    // Update the header varint (uncompressed size) of an edge in-place without shifting.
+    // Grows only if the new varint fits into the existing header byte-length; otherwise throws.
+    void setEdgeSizeHeader(const HyperedgeID e, const HypernodeID new_size) {
+    ASSERT(edgeIsEnabled(e), "Hyperedge" << e << "is disabled");
+    const size_t begin = _hyperedge_offsets[e];
+        const size_t end = hyperedge_firstInvalidEntry(e);
+        // Determine current header length
+        size_t pos = begin;
+        (void)decode_varint_bounded(_compressed_incidence_array, pos, end);
+        const size_t cur_len = pos - begin;
+        std::vector<uint8_t> header;
+        encode_varint_fixed_len(static_cast<uint64_t>(new_size), cur_len, header);
+        // Write header back
+        std::copy(header.begin(), header.end(), _compressed_incidence_array.begin() + begin);
+    }
+
+    // Update the header varint (degree) of a node in-place without shifting.
+    void setNodeDegreeHeader(const HypernodeID u, const HyperedgeID new_deg) {
+    ASSERT(nodeIsEnabled(u), "Hypernode" << u << "is disabled");
+    const size_t begin = _hypernode_offsets[u];
+        const size_t end = hypernode_firstInvalidEntry(u);
+        // Determine current header length
+        size_t pos = begin;
+        (void)decode_varint_bounded(_compressed_incident_nets, pos, end);
+        const size_t cur_len = pos - begin;
+        std::vector<uint8_t> header;
+        encode_varint_fixed_len(static_cast<uint64_t>(new_deg), cur_len, header);
+        // Write header back
+        std::copy(header.begin(), header.end(), _compressed_incident_nets.begin() + begin);
     }
 
     // ####################### Hypernode Information #######################
 
     HypernodeWeight nodeWeight(const HypernodeID u) const {
-        return hypernode(u).weight();
+        if (_hypernode_weights.empty()) return 1;
+        return _hypernode_weights[u];
     }
 
     void setNodeWeight(const HypernodeID u, const HypernodeWeight weight) {
-        ASSERT(!hypernode(u).isDisabled(), "Hypernode" << u << "is disabled");
-        return hypernode(u).setWeight(weight);
+        ASSERT(nodeIsEnabled(u), "Hypernode" << u << "is disabled");
+        if (_hypernode_weights.empty()) _hypernode_weights.assign(_num_hypernodes, 1);
+        _hypernode_weights[u] = weight;
     }
 
     HyperedgeID nodeDegree(const HypernodeID u) const {
-        ASSERT(!hypernode(u).isDisabled(), "Hypernode" << u << "is disabled");
-        return hypernode(u).size();
+        ASSERT(nodeIsEnabled(u), "Hypernode" << u << "is disabled");
+        const size_t begin = _hypernode_offsets[u];
+        const size_t end = hypernode_firstInvalidEntry(u);
+        size_t pos = begin;
+        return static_cast<HyperedgeID>(decode_varint_bounded(_compressed_incident_nets, pos, end));
     }
 
-    bool nodeIsEnabled(const HypernodeID u) const {
-        return !hypernode(u).isDisabled();
-    }
-
-    void enableHypernode(const HypernodeID u) {
-        hypernode(u).enable();
-    }
-
-    void disableHypernode(const HypernodeID u) {
-        hypernode(u).disable();
-    }
+    bool nodeIsEnabled(const HypernodeID u) const { return _hypernode_enabled[u]; }
+    void enableHypernode(const HypernodeID u) { _hypernode_enabled[u] = true; }
+    void disableHypernode(const HypernodeID u) { _hypernode_enabled[u] = false; }
 
     void removeHypernode(const HypernodeID u) {
         hypernode(u).disable();
@@ -788,35 +787,32 @@ public:
     // ####################### Hyperedge Information #######################
 
     HypernodeWeight edgeWeight(const HyperedgeID e) const {
-        ASSERT(!hyperedge(e).isDisabled(), "Hyperedge" << e << "is disabled");
-        return hyperedge(e).weight();
+        ASSERT(edgeIsEnabled(e), "Hyperedge" << e << "is disabled");
+        if (_hyperedge_weights.empty()) return 1;
+        return _hyperedge_weights[e];
     }
 
     void setEdgeWeight(const HyperedgeID e, const HyperedgeWeight weight) {
-        ASSERT(!hyperedge(e).isDisabled(), "Hyperedge" << e << "is disabled");
-        return hyperedge(e).setWeight(weight);
+        ASSERT(edgeIsEnabled(e), "Hyperedge" << e << "is disabled");
+        if (_hyperedge_weights.empty()) _hyperedge_weights.assign(_num_hyperedges, 1);
+        _hyperedge_weights[e] = weight;
     }
 
     HypernodeID edgeSize(const HyperedgeID e) const {
-        ASSERT(!hyperedge(e).isDisabled(), "Hyperedge" << e << "is disabled");
-        return hyperedge(e).size();
+        ASSERT(edgeIsEnabled(e), "Hyperedge" << e << "is disabled");
+        const size_t begin = _hyperedge_offsets[e];
+        const size_t end = hyperedge_firstInvalidEntry(e);
+        size_t pos = begin;
+        return static_cast<HypernodeID>(decode_varint_bounded(_compressed_incidence_array, pos, end));
     }
 
     HypernodeID maxEdgeSize() const {
         return _max_edge_size;
     }
 
-    bool edgeIsEnabled(const HyperedgeID e) const {
-        return !hyperedge(e).isDisabled();
-    }
-
-    void enableHyperedge(const HyperedgeID e) {
-        hyperedge(e).enable();
-    }
-
-    void disableHyperedge(const HyperedgeID e) {
-        hyperedge(e).disable();
-    }
+    bool edgeIsEnabled(const HyperedgeID e) const { return _hyperedge_enabled[e]; }
+    void enableHyperedge(const HyperedgeID e) { _hyperedge_enabled[e] = true; }
+    void disableHyperedge(const HyperedgeID e) { _hyperedge_enabled[e] = false; }
 
     PartitionID communityID(const HypernodeID u) const {
         return _community_ids[u];
@@ -904,14 +900,14 @@ public:
     void removeEdge(const HyperedgeID he) {
         ASSERT(edgeIsEnabled(he), "Hyperedge" << he << "is disabled");
 
-        // Decode pins of the hyperedge
-        const Hyperedge& edge = hyperedge(he);
-        size_t he_pos = edge.firstEntry();
-        const size_t he_end = edge.firstInvalidEntry();
+        size_t he_pos = _hyperedge_offsets[he];
+        const size_t he_end = hyperedge_firstInvalidEntry(he);
         std::vector<HypernodeID> pins_of_he;
-        pins_of_he.reserve(edge.size());
+        pins_of_he.reserve(edgeSize(he));
         {
             HypernodeID acc = 0;
+            // skip header varint (edge size)
+            (void)decode_varint_bounded(_compressed_incidence_array, he_pos, he_end);
             while (he_pos < he_end) {
                 const uint64_t gap = decode_varint_bounded(_compressed_incidence_array, he_pos, he_end);
                 acc += static_cast<HypernodeID>(gap);
@@ -920,67 +916,63 @@ public:
         }
 
         // For each pin, attempt in-place shrink; if any overflow, fallback to repack
-        struct PendingUpdate { HypernodeID u; std::vector<uint8_t> bytes; size_t new_size; size_t begin; size_t cap; size_t new_uncompressed; };
+        struct PendingUpdate { HypernodeID u; std::vector<uint8_t> bytes; size_t begin; size_t cap; };
         std::vector<PendingUpdate> pending; pending.reserve(pins_of_he.size());
         bool needs_repack = false;
         for (const HypernodeID u : pins_of_he) {
             if (!nodeIsEnabled(u)) continue;
-            Hypernode& hn = hypernode(u);
-            const size_t begin = hn.firstEntry();
-            const size_t end = hn.firstInvalidEntry();
+            const size_t begin = _hypernode_offsets[u];
+            const size_t end = hypernode_firstInvalidEntry(u);
             // Decode current incidents
-            std::vector<HyperedgeID> inc; inc.reserve(hn.size());
-            size_t cur = begin; HyperedgeID acc = 0;
+            std::vector<HyperedgeID> inc; inc.reserve(nodeDegree(u));
+            size_t cur = begin; (void)decode_varint_bounded(_compressed_incident_nets, cur, end); HyperedgeID acc = 0;
             while (cur < end) { const uint64_t gap = decode_varint_bounded(_compressed_incident_nets, cur, end); acc += static_cast<HyperedgeID>(gap); if (acc != he && acc < _num_hyperedges) inc.push_back(acc); }
             // Re-encode
             std::vector<uint8_t> bytes;
-            if (!inc.empty()) {
-                std::sort(inc.begin(), inc.end()); inc.erase(std::unique(inc.begin(), inc.end()), inc.end());
-                HyperedgeID prev = 0; for (HyperedgeID x : inc) { ASSERT(x >= prev); encode_varint(static_cast<uint64_t>(x - prev), bytes); prev = x; }
-            }
-            const size_t new_size = bytes.size();
+            std::sort(inc.begin(), inc.end()); inc.erase(std::unique(inc.begin(), inc.end()), inc.end());
+            encode_varint(static_cast<uint64_t>(inc.size()), bytes); // header
+            HyperedgeID prev = 0; for (HyperedgeID x : inc) { ASSERT(x >= prev); encode_varint(static_cast<uint64_t>(x - prev), bytes); prev = x; }
             // Capacity up to next enabled node
             HypernodeID v = u + 1; while (v < _num_hypernodes && !nodeIsEnabled(v)) ++v;
-            size_t next_begin = (v < _num_hypernodes) ? hypernode(v).firstEntry() : _compressed_incident_nets.size();
+            size_t next_begin = (v < _num_hypernodes) ? _hypernode_offsets[v] : _compressed_incident_nets.size();
             const size_t cap = next_begin - begin;
-            if (new_size > cap) needs_repack = true;
-            pending.push_back(PendingUpdate{u, std::move(bytes), new_size, begin, cap, inc.size()});
+            if (bytes.size() > cap) needs_repack = true;
+            pending.push_back(PendingUpdate{u, std::move(bytes), begin, cap});
         }
 
         if (!needs_repack) {
             for (auto& up : pending) {
-                Hypernode& hn = hypernode(up.u);
-                if (up.new_size > 0) {
+                if (!up.bytes.empty()) {
                     std::copy(up.bytes.begin(), up.bytes.end(), _compressed_incident_nets.begin() + up.begin);
                 }
-                hn.setCompressedSize(up.new_size);
-                hn.setUncompressedSize(up.new_uncompressed);
             }
         } else {
             // Repack only if absolutely necessary (rare due to varint edge cases)
             std::unordered_map<HypernodeID, std::vector<uint8_t>> overrides;
             overrides.reserve(pending.size());
-            for (const auto& up : pending) { overrides.emplace(up.u, up.bytes); hypernode(up.u).setUncompressedSize(up.new_uncompressed); }
+            for (const auto& up : pending) { overrides.emplace(up.u, up.bytes); }
             // Snapshot current begins/ends
             std::vector<size_t> old_begin(_num_hypernodes), old_end(_num_hypernodes);
-            for (HypernodeID u = 0; u < _num_hypernodes; ++u) { const Hypernode& hn = hypernode(u); old_begin[u] = hn.firstEntry(); old_end[u] = hn.firstInvalidEntry(); }
+            for (HypernodeID u = 0; u < _num_hypernodes; ++u) { old_begin[u] = _hypernode_offsets[u]; old_end[u] = hypernode_firstInvalidEntry(u); }
             auto encode_from_snapshot = [&](HypernodeID u) {
-                std::vector<HyperedgeID> inc; size_t cur = old_begin[u]; const size_t end = old_end[u]; HyperedgeID acc = 0;
+                std::vector<HyperedgeID> inc; size_t cur = old_begin[u]; const size_t end = old_end[u];
+                (void)decode_varint_bounded(_compressed_incident_nets, cur, end);
+                HyperedgeID acc = 0;
                 while (cur < end) { const uint64_t g = decode_varint_bounded(_compressed_incident_nets, cur, end); acc += static_cast<HyperedgeID>(g); if (acc < _num_hyperedges) inc.push_back(acc); }
-                std::vector<uint8_t> out; if (!inc.empty()) { std::sort(inc.begin(), inc.end()); inc.erase(std::unique(inc.begin(), inc.end()), inc.end()); HyperedgeID prev = 0; for (HyperedgeID x : inc) { ASSERT(x >= prev); encode_varint(static_cast<uint64_t>(x - prev), out); prev = x; } }
+                std::vector<uint8_t> out; std::sort(inc.begin(), inc.end()); inc.erase(std::unique(inc.begin(), inc.end()), inc.end());
+                encode_varint(static_cast<uint64_t>(inc.size()), out);
+                HyperedgeID prev = 0; for (HyperedgeID x : inc) { ASSERT(x >= prev); encode_varint(static_cast<uint64_t>(x - prev), out); prev = x; }
                 return out;
             };
             CompressedIncidentNets new_incident_nets; new_incident_nets.reserve(_compressed_incident_nets.size());
             size_t write_pos = 0;
             for (HypernodeID u = 0; u < _num_hypernodes; ++u) {
-                Hypernode& hn = hypernode(u);
                 if (!nodeIsEnabled(u)) continue;
-                hn.setFirstEntry(write_pos);
+                _hypernode_offsets[u] = write_pos;
                 std::vector<uint8_t> bytes;
                 auto it = overrides.find(u);
                 if (it != overrides.end()) { bytes = it->second; } else { bytes = encode_from_snapshot(u); }
                 new_incident_nets.insert(new_incident_nets.end(), bytes.begin(), bytes.end());
-                hn.setCompressedSize(bytes.size());
                 write_pos += bytes.size();
             }
             _compressed_incident_nets.swap(new_incident_nets);
@@ -993,14 +985,14 @@ public:
     void removeLargeEdge(const HyperedgeID he) {
         ASSERT(edgeIsEnabled(he), "Hyperedge" << he << "is disabled");
 
-        // Decode pins
-        const Hyperedge& edge = hyperedge(he);
-        size_t he_pos = edge.firstEntry();
-        const size_t he_end = edge.firstInvalidEntry();
+        size_t he_pos = _hyperedge_offsets[he];
+        const size_t he_end = hyperedge_firstInvalidEntry(he);
         std::vector<HypernodeID> pins_of_he;
-        pins_of_he.reserve(edge.size());
+        pins_of_he.reserve(edgeSize(he));
         {
             HypernodeID acc = 0;
+            // skip header varint (edge size)
+            (void)decode_varint_bounded(_compressed_incidence_array, he_pos, he_end);
             while (he_pos < he_end) {
                 const uint64_t gap = decode_varint_bounded(_compressed_incidence_array, he_pos, he_end);
                 acc += static_cast<HypernodeID>(gap);
@@ -1009,61 +1001,60 @@ public:
         }
 
         // Attempt in-place shrink for each affected node; fallback to repack if any overflow
-        struct PendingUpdateLE { HypernodeID u; std::vector<uint8_t> bytes; size_t new_size; size_t begin; size_t cap; size_t new_uncompressed; };
+        struct PendingUpdateLE { HypernodeID u; std::vector<uint8_t> bytes; size_t begin; size_t cap; };
         std::vector<PendingUpdateLE> updates; updates.reserve(pins_of_he.size());
         bool needs_repack = false;
         for (const HypernodeID u : pins_of_he) {
             if (!nodeIsEnabled(u)) continue;
-            Hypernode& hn = hypernode(u);
-            const size_t begin = hn.firstEntry();
-            const size_t end = hn.firstInvalidEntry();
+            const size_t begin = _hypernode_offsets[u];
+            const size_t end = hypernode_firstInvalidEntry(u);
             // Decode incidents
-            std::vector<HyperedgeID> inc; inc.reserve(hn.size());
-            size_t cur = begin; HyperedgeID acc = 0;
+            std::vector<HyperedgeID> inc; inc.reserve(nodeDegree(u));
+            size_t cur = begin; (void)decode_varint_bounded(_compressed_incident_nets, cur, end); HyperedgeID acc = 0;
             while (cur < end) { const uint64_t gap = decode_varint_bounded(_compressed_incident_nets, cur, end); acc += static_cast<HyperedgeID>(gap); if (acc != he && acc < _num_hyperedges) inc.push_back(acc); }
             std::vector<uint8_t> bytes;
-            if (!inc.empty()) { std::sort(inc.begin(), inc.end()); inc.erase(std::unique(inc.begin(), inc.end()), inc.end()); HyperedgeID prev = 0; for (HyperedgeID x : inc) { ASSERT(x >= prev); encode_varint(static_cast<uint64_t>(x - prev), bytes); prev = x; } }
-            const size_t new_size = bytes.size();
+            std::sort(inc.begin(), inc.end()); inc.erase(std::unique(inc.begin(), inc.end()), inc.end());
+            encode_varint(static_cast<uint64_t>(inc.size()), bytes);
+            HyperedgeID prev = 0; for (HyperedgeID x : inc) { ASSERT(x >= prev); encode_varint(static_cast<uint64_t>(x - prev), bytes); prev = x; }
             // Capacity to next enabled node
             HypernodeID v = u + 1; while (v < _num_hypernodes && !nodeIsEnabled(v)) ++v;
-            const size_t next_begin = (v < _num_hypernodes) ? hypernode(v).firstEntry() : _compressed_incident_nets.size();
+            const size_t next_begin = (v < _num_hypernodes) ? _hypernode_offsets[v] : _compressed_incident_nets.size();
             const size_t cap = next_begin - begin;
-            if (new_size > cap) needs_repack = true;
-            updates.push_back(PendingUpdateLE{u, std::move(bytes), new_size, begin, cap, inc.size()});
+            if (bytes.size() > cap) needs_repack = true;
+            updates.push_back(PendingUpdateLE{u, std::move(bytes), begin, cap});
         }
         if (!needs_repack) {
             for (auto& up : updates) {
-                Hypernode& hn = hypernode(up.u);
-                if (up.new_size > 0) {
+                if (!up.bytes.empty()) {
                     std::copy(up.bytes.begin(), up.bytes.end(), _compressed_incident_nets.begin() + up.begin);
                 }
-                hn.setCompressedSize(up.new_size);
-                hn.setUncompressedSize(up.new_uncompressed);
             }
         } else {
             // Repack fallback
             std::unordered_map<HypernodeID, std::vector<uint8_t>> overrides;
             overrides.reserve(updates.size());
-            for (const auto& up : updates) { overrides.emplace(up.u, up.bytes); hypernode(up.u).setUncompressedSize(up.new_uncompressed); }
+            for (const auto& up : updates) { overrides.emplace(up.u, up.bytes); }
             std::vector<size_t> old_begin(_num_hypernodes), old_end(_num_hypernodes);
-            for (HypernodeID u = 0; u < _num_hypernodes; ++u) { const Hypernode& hn = hypernode(u); old_begin[u] = hn.firstEntry(); old_end[u] = hn.firstInvalidEntry(); }
+            for (HypernodeID u = 0; u < _num_hypernodes; ++u) { old_begin[u] = _hypernode_offsets[u]; old_end[u] = hypernode_firstInvalidEntry(u); }
             auto encode_from_snapshot = [&](HypernodeID u) {
-                std::vector<HyperedgeID> inc; size_t cur = old_begin[u]; const size_t end = old_end[u]; HyperedgeID acc = 0;
+                std::vector<HyperedgeID> inc; size_t cur = old_begin[u]; const size_t end = old_end[u];
+                (void)decode_varint_bounded(_compressed_incident_nets, cur, end);
+                HyperedgeID acc = 0;
                 while (cur < end) { const uint64_t g = decode_varint_bounded(_compressed_incident_nets, cur, end); acc += static_cast<HyperedgeID>(g); if (acc < _num_hyperedges) inc.push_back(acc); }
-                std::vector<uint8_t> out; if (!inc.empty()) { std::sort(inc.begin(), inc.end()); inc.erase(std::unique(inc.begin(), inc.end()), inc.end()); HyperedgeID prev = 0; for (HyperedgeID x : inc) { ASSERT(x >= prev); encode_varint(static_cast<uint64_t>(x - prev), out); prev = x; } }
+                std::vector<uint8_t> out; std::sort(inc.begin(), inc.end()); inc.erase(std::unique(inc.begin(), inc.end()), inc.end());
+                encode_varint(static_cast<uint64_t>(inc.size()), out);
+                HyperedgeID prev = 0; for (HyperedgeID x : inc) { ASSERT(x >= prev); encode_varint(static_cast<uint64_t>(x - prev), out); prev = x; }
                 return out;
             };
             CompressedIncidentNets new_incident_nets; new_incident_nets.reserve(_compressed_incident_nets.size());
             size_t write_pos = 0;
             for (HypernodeID u = 0; u < _num_hypernodes; ++u) {
-                Hypernode& hn = hypernode(u);
                 if (!nodeIsEnabled(u)) continue;
-                hn.setFirstEntry(write_pos);
+                _hypernode_offsets[u] = write_pos;
                 std::vector<uint8_t> bytes;
                 auto it = overrides.find(u);
                 if (it != overrides.end()) { bytes = it->second; } else { bytes = encode_from_snapshot(u); }
                 new_incident_nets.insert(new_incident_nets.end(), bytes.begin(), bytes.end());
-                hn.setCompressedSize(bytes.size());
                 write_pos += bytes.size();
             }
             _compressed_incident_nets.swap(new_incident_nets);
@@ -1077,13 +1068,14 @@ public:
         ASSERT(!edgeIsEnabled(he), "Hyperedge" << he << "is enabled");
 
         // Decode pins of the hyperedge
-        const Hyperedge& edge = hyperedge(he);
-        size_t he_pos = edge.firstEntry();
-        const size_t he_end = edge.firstInvalidEntry();
+        size_t he_pos = _hyperedge_offsets[he];
+        const size_t he_end = hyperedge_firstInvalidEntry(he);
         std::vector<HypernodeID> pins_of_he;
-        pins_of_he.reserve(edge.size());
+        pins_of_he.reserve(edgeSize(he));
         {
             HypernodeID acc = 0;
+            // skip header varint (edge size)
+            (void)decode_varint_bounded(_compressed_incidence_array, he_pos, he_end);
             while (he_pos < he_end) {
                 const uint64_t gap = decode_varint_bounded(_compressed_incidence_array, he_pos, he_end);
                 acc += static_cast<HypernodeID>(gap);
@@ -1092,47 +1084,41 @@ public:
         }
 
         // First pass: compute new bytes per affected node and check if in-place growth fits
-    struct PendingUpdate { HypernodeID u; std::vector<uint8_t> bytes; size_t new_size; size_t begin; size_t old_size; size_t cap; size_t new_uncompressed; };
+    struct PendingUpdate { HypernodeID u; std::vector<uint8_t> bytes; size_t begin; size_t cap; };
         std::vector<PendingUpdate> pending; pending.reserve(pins_of_he.size());
         bool needs_repack = false;
         for (const HypernodeID u : pins_of_he) {
             if (!nodeIsEnabled(u)) continue;
-            Hypernode& hn = hypernode(u);
-            const size_t begin = hn.firstEntry();
-            const size_t old_size = hn.compressedSize();
-            const size_t end = begin + old_size;
+            const size_t begin = _hypernode_offsets[u];
+            const size_t end = hypernode_firstInvalidEntry(u);
             // Decode existing incidents
-            std::vector<HyperedgeID> inc; inc.reserve(hn.size() + 1);
-            size_t cur = begin; HyperedgeID acc = 0;
+            std::vector<HyperedgeID> inc; inc.reserve(nodeDegree(u) + 1);
+            size_t cur = begin; (void)decode_varint_bounded(_compressed_incident_nets, cur, end); HyperedgeID acc = 0;
             while (cur < end) { const uint64_t g = decode_varint_bounded(_compressed_incident_nets, cur, end); acc += static_cast<HyperedgeID>(g); if (acc < _num_hyperedges) inc.push_back(acc); }
             // Insert he and encode
             inc.push_back(he);
             std::sort(inc.begin(), inc.end()); inc.erase(std::unique(inc.begin(), inc.end()), inc.end());
-            std::vector<uint8_t> bytes; bytes.reserve(old_size + 4);
+            std::vector<uint8_t> bytes;
+            encode_varint(static_cast<uint64_t>(inc.size()), bytes);
             HyperedgeID prev = 0; for (HyperedgeID x : inc) { ASSERT(x >= prev); encode_varint(static_cast<uint64_t>(x - prev), bytes); prev = x; }
-            const size_t new_size = bytes.size();
-            const size_t new_uncompressed = inc.size();
             // Compute available capacity up to next enabled node begin (or vector end)
             HypernodeID v = u + 1; while (v < _num_hypernodes && !nodeIsEnabled(v)) ++v;
-            size_t next_begin = (v < _num_hypernodes) ? hypernode(v).firstEntry() : _compressed_incident_nets.size();
+            size_t next_begin = (v < _num_hypernodes) ? _hypernode_offsets[v] : _compressed_incident_nets.size();
             size_t cap = next_begin - begin; // bytes we can occupy without moving neighbors
-            if (new_size > cap) needs_repack = true;
-            pending.push_back(PendingUpdate{u, std::move(bytes), new_size, begin, old_size, cap, new_uncompressed});
+            if (bytes.size() > cap) needs_repack = true;
+            pending.push_back(PendingUpdate{u, std::move(bytes), begin, cap});
         }
 
         if (!needs_repack) {
             // In-place apply all updates (may extend vector for last node)
             for (auto& up : pending) {
-                Hypernode& hn = hypernode(up.u);
-                size_t needed_end = up.begin + up.new_size;
+                size_t needed_end = up.begin + up.bytes.size();
                 if (needed_end > _compressed_incident_nets.size()) {
                     _compressed_incident_nets.resize(needed_end);
                 }
-                if (up.new_size > 0) {
+                if (!up.bytes.empty()) {
                     std::copy(up.bytes.begin(), up.bytes.end(), _compressed_incident_nets.begin() + up.begin);
                 }
-                hn.setCompressedSize(up.new_size);
-                hn.setUncompressedSize(up.new_uncompressed);
             }
         } else {
             // Fallback: single repack using prepared bytes for affected nodes
@@ -1141,24 +1127,21 @@ public:
             for (const auto& up : pending) { overrides.emplace(up.u, up.bytes); }
             // Snapshot current begins/ends
             std::vector<size_t> old_begin(_num_hypernodes), old_end(_num_hypernodes);
-            for (HypernodeID u = 0; u < _num_hypernodes; ++u) {
-                const Hypernode& hn = hypernode(u);
-                old_begin[u] = hn.firstEntry();
-                old_end[u] = hn.firstInvalidEntry();
-            }
+            for (HypernodeID u = 0; u < _num_hypernodes; ++u) { old_begin[u] = _hypernode_offsets[u]; old_end[u] = hypernode_firstInvalidEntry(u); }
             // Helper to decode an untouched node from snapshot and encode again
             auto encode_from_snapshot = [&](HypernodeID u) {
-                std::vector<HyperedgeID> inc; size_t cur = old_begin[u]; const size_t end = old_end[u]; HyperedgeID acc = 0;
+                std::vector<HyperedgeID> inc; size_t cur = old_begin[u]; const size_t end = old_end[u];
+                (void)decode_varint_bounded(_compressed_incident_nets, cur, end);
+                HyperedgeID acc = 0;
                 while (cur < end) { const uint64_t g = decode_varint_bounded(_compressed_incident_nets, cur, end); acc += static_cast<HyperedgeID>(g); if (acc < _num_hyperedges) inc.push_back(acc); }
-                std::vector<uint8_t> out; if (!inc.empty()) { std::sort(inc.begin(), inc.end()); inc.erase(std::unique(inc.begin(), inc.end()), inc.end()); HyperedgeID prev = 0; for (HyperedgeID x : inc) { ASSERT(x >= prev); encode_varint(static_cast<uint64_t>(x - prev), out); prev = x; } }
+                std::vector<uint8_t> out; if (!inc.empty()) { std::sort(inc.begin(), inc.end()); inc.erase(std::unique(inc.begin(), inc.end()), inc.end()); encode_varint(static_cast<uint64_t>(inc.size()), out); HyperedgeID prev = 0; for (HyperedgeID x : inc) { ASSERT(x >= prev); encode_varint(static_cast<uint64_t>(x - prev), out); prev = x; } }
                 return out;
             };
             CompressedIncidentNets new_incident_nets; new_incident_nets.reserve(_compressed_incident_nets.size() + 16);
             size_t write_pos = 0;
             for (HypernodeID u = 0; u < _num_hypernodes; ++u) {
-                Hypernode& hn = hypernode(u);
                 if (!nodeIsEnabled(u)) continue;
-                hn.setFirstEntry(write_pos);
+                _hypernode_offsets[u] = write_pos;
                 std::vector<uint8_t> bytes;
                 auto it = overrides.find(u);
                 if (it != overrides.end()) {
@@ -1167,12 +1150,10 @@ public:
                     bytes = encode_from_snapshot(u);
                 }
                 new_incident_nets.insert(new_incident_nets.end(), bytes.begin(), bytes.end());
-                hn.setCompressedSize(bytes.size());
                 write_pos += bytes.size();
             }
             _compressed_incident_nets.swap(new_incident_nets);
-            // Update uncompressed sizes precisely for affected nodes in fallback path
-            for (auto& up : pending) { hypernode(up.u).setUncompressedSize(up.new_uncompressed); }
+            // No explicit size metadata to update
         }
 
         // Re-enable the edge
@@ -1218,12 +1199,16 @@ public:
         // Delete any temporary contraction buffer
         freeTmpContractionBuffer();
         // Release main containers
-        _hypernodes.clear();
-        _hypernodes.shrink_to_fit();
+    _hypernode_offsets.clear();
+    _hypernode_offsets.shrink_to_fit();
+    _hypernode_enabled.clear();
+    _hypernode_enabled.shrink_to_fit();
         _compressed_incident_nets.clear();
         _compressed_incident_nets.shrink_to_fit();
-        _hyperedges.clear();
-        _hyperedges.shrink_to_fit();
+    _hyperedge_offsets.clear();
+    _hyperedge_offsets.shrink_to_fit();
+    _hyperedge_enabled.clear();
+    _hyperedge_enabled.shrink_to_fit();
         _compressed_incidence_array.clear();
         _compressed_incidence_array.shrink_to_fit();
         _community_ids.clear();
@@ -1252,13 +1237,18 @@ public:
 
     size_t memoryConsumptionKB() const {
         size_t total = 0;
-        total += sizeof(Hypernode) * _hypernodes.size();
+        total += sizeof(size_t) * _hypernode_offsets.capacity();
+    // BitVector packs bits; approximate bytes as ceil(capacity_in_bits/8)
+        total += ((_hypernode_enabled.capacity() + 7) / 8);
         total += sizeof(uint8_t) * _compressed_incident_nets.size();
-        total += sizeof(Hyperedge) * _hyperedges.size();
+        total += sizeof(size_t) * _hyperedge_offsets.capacity();
+    total += ((_hyperedge_enabled.capacity() + 7) / 8);
         total += sizeof(uint8_t) * _compressed_incidence_array.size();
+        total += sizeof(HypernodeWeight) * _hypernode_weights.capacity();
+        total += sizeof(HyperedgeWeight) * _hyperedge_weights.capacity();
         total += sizeof(PartitionID) * _community_ids.capacity();
         if (_fixed_vertices.hasFixedVertices()) {
-        total += _fixed_vertices.size_in_bytes();
+            total += _fixed_vertices.size_in_bytes();
         }
         return total / 1024;
     }
@@ -1279,13 +1269,13 @@ private:
 
     // ####################### Hypernode Information #######################
 
-    MT_KAHYPAR_ATTRIBUTE_ALWAYS_INLINE const Hypernode& hypernode(const HypernodeID u) const {
+    MT_KAHYPAR_ATTRIBUTE_ALWAYS_INLINE Hypernode hypernode(const HypernodeID u) const {
         ASSERT(u < _num_hypernodes, "Hypernode" << u << " does not exist");
-        return _hypernodes[u];
+        return Hypernode(this, u);
     }
 
-    MT_KAHYPAR_ATTRIBUTE_ALWAYS_INLINE Hypernode& hypernode(const HypernodeID u) {
-        return const_cast<Hypernode&>(static_cast<const CompressedHypergraph&>(*this).hypernode(u));
+    MT_KAHYPAR_ATTRIBUTE_ALWAYS_INLINE Hypernode hypernode(const HypernodeID u) {
+        return Hypernode(this, u);
     }
 
    MT_KAHYPAR_ATTRIBUTE_ALWAYS_INLINE IteratorRange<IncidentNetsIterator>
@@ -1295,37 +1285,58 @@ private:
            throw UnsupportedOperationException(
                "incident_nets_of(u, pos) with pos > 0 is not supported in compressed hypergraph");
         }
-       const Hypernode& hn = hypernode(u);
+       const size_t begin = hypernode(u).firstEntry();
+       const size_t end = hypernode_firstInvalidEntry(u);
+       size_t p = begin; const size_t deg = static_cast<size_t>(decode_varint_bounded(_compressed_incident_nets, p, end));
        return IteratorRange<IncidentNetsIterator>(
-           IncidentNetsIterator(_compressed_incident_nets, hn.firstEntry(), hn.firstInvalidEntry(), _num_hyperedges),
-           IncidentNetsIterator(_compressed_incident_nets, hn.firstInvalidEntry()));
+           IncidentNetsIterator(_compressed_incident_nets, p, end, _num_hyperedges, &_hyperedge_enabled, deg),
+           IncidentNetsIterator(_compressed_incident_nets, end));
    }
 
     // ####################### Hyperedge Information #######################
 
-    MT_KAHYPAR_ATTRIBUTE_ALWAYS_INLINE const Hyperedge& hyperedge(const HyperedgeID e) const {
+    MT_KAHYPAR_ATTRIBUTE_ALWAYS_INLINE Hyperedge hyperedge(const HyperedgeID e) const {
         ASSERT(e < _num_hyperedges, "Hyperedge " << e << " does not exist");
-        return _hyperedges[e];
+        return Hyperedge(this, e);
     }
 
-    MT_KAHYPAR_ATTRIBUTE_ALWAYS_INLINE Hyperedge& hyperedge(const HyperedgeID e) {
-        return const_cast<Hyperedge&>(static_cast<const CompressedHypergraph&>(*this).hyperedge(e));
+    MT_KAHYPAR_ATTRIBUTE_ALWAYS_INLINE Hyperedge hyperedge(const HyperedgeID e) {
+        return Hyperedge(this, e);
     }
 
     MT_KAHYPAR_ATTRIBUTE_ALWAYS_INLINE HypernodeID pinAt(const HyperedgeID e, const size_t local_pos) const {
-        ASSERT(!hyperedge(e).isDisabled(), "Hyperedge" << e << "is disabled");
+        ASSERT(edgeIsEnabled(e), "Hyperedge" << e << "is disabled");
         ASSERT(local_pos < edgeSize(e));
-        // Decode varints up to local_pos
-        const Hyperedge& he = hyperedge(e);
-        size_t cur = he.firstEntry();
-        const size_t end = he.firstInvalidEntry();
+        // Decode varints up to local_pos, skipping zero-gap placeholders
+        size_t cur = _hyperedge_offsets[e];
+        const size_t end = hyperedge_firstInvalidEntry(e);
+        [[maybe_unused]] const size_t esize = static_cast<size_t>(decode_varint_bounded(_compressed_incidence_array, cur, end));
+        ASSERT(local_pos < esize);
         HypernodeID acc = 0;
-        for (size_t i = 0; i <= local_pos; ++i) {
-            ASSERT(cur < end);
+        size_t emitted = 0;
+        while (cur < end && emitted <= local_pos) {
             const uint64_t gap = decode_varint_bounded(_compressed_incidence_array, cur, end);
+            if (emitted > 0 && gap == 0) { continue; }
             acc += static_cast<HypernodeID>(gap);
+            if (emitted == local_pos) return acc;
+            ++emitted;
         }
+        // Should not reach here due to assertion
         return acc;
+    }
+
+    // Computes end offset for hyperedge e using neighbor begin or array end; then trims trailing zeros.
+    MT_KAHYPAR_ATTRIBUTE_ALWAYS_INLINE size_t hyperedge_firstInvalidEntry(const HyperedgeID e) const {
+        ASSERT(e < _num_hyperedges);
+        const size_t end = (e + 1 < _num_hyperedges) ? _hyperedge_offsets[e + 1] : _compressed_incidence_array.size();
+        return end;
+    }
+
+    // Computes end offset for hypernode u using neighbor begin or array end; then trims trailing zeros.
+    MT_KAHYPAR_ATTRIBUTE_ALWAYS_INLINE size_t hypernode_firstInvalidEntry(const HypernodeID u) const {
+        ASSERT(u < _num_hypernodes);
+        const size_t end = (u + 1 < _num_hypernodes) ? _hypernode_offsets[u + 1] : _compressed_incident_nets.size();
+        return end;
     }
 
     void allocateTmpContractionBuffer() {
@@ -1347,10 +1358,15 @@ private:
     HypernodeWeight _total_weight;
 
     // Hypergraph structure with compression
-    std::vector<Hypernode> _hypernodes;
+    std::vector<size_t> _hypernode_offsets;   // CSR offsets into _compressed_incident_nets
+    BitVector _hypernode_enabled;             // true = enabled, false = disabled
     CompressedIncidentNets _compressed_incident_nets;    // Compressed incident nets storage
-    std::vector<Hyperedge> _hyperedges;
+    std::vector<size_t> _hyperedge_offsets;   // CSR offsets into _compressed_incidence_array
+    BitVector _hyperedge_enabled;             // true = enabled, false = disabled
     CompressedIncidenceArray _compressed_incidence_array;  // Compressed pins storage
+    // Lazy weight storage (default 1 when empty)
+    std::vector<HypernodeWeight> _hypernode_weights;
+    std::vector<HyperedgeWeight> _hyperedge_weights;
 
     // Communities and fixed vertices (uncompressed as requested)
     ds::Clustering _community_ids;
