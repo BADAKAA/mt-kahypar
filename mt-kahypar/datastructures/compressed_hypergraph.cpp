@@ -134,18 +134,22 @@ namespace mt_kahypar::ds {
     for (HyperedgeID he = 0; he < _num_hyperedges; ++he) {
       if (!edgeIsEnabled(he)) continue;
 
-      const auto& e = _hyperedges[he];
-      const size_t begin = e.firstEntry();
-      const size_t end   = e.firstInvalidEntry();
+      const size_t begin = _hyperedge_offsets[he];
+      const size_t end   = hyperedge_firstInvalidEntry(he);
       size_t pos = begin;
       HypernodeID prev = 0;
 
       std::vector<HypernodeID> pins;
-      pins.reserve(e.size()); // uncompressed size available
-      while (pos < end) {
-        uint64_t gap = decode_varint(_compressed_incidence_array, pos);
-        HypernodeID v = static_cast<HypernodeID>(prev + gap);
+      // Read header varint for uncompressed edge size and reserve
+      const size_t esize = static_cast<size_t>(decode_varint_bounded(_compressed_incidence_array, pos, end));
+      pins.reserve(esize);
+      size_t emitted = 0;
+      while (pos < end && emitted < esize) {
+        const uint64_t gap = decode_varint_bounded(_compressed_incidence_array, pos, end);
+        if (emitted > 0 && gap == 0) { continue; }
+        const HypernodeID v = static_cast<HypernodeID>(prev + gap);
         prev = v;
+        ++emitted;
         const HypernodeID ch = map_to_coarse(v);
         if (ch != kInvalidHypernode) {
           pins.push_back(ch);
@@ -165,11 +169,11 @@ namespace mt_kahypar::ds {
       if (it == parallel_map.end()) {
         HyperedgeID new_id = static_cast<HyperedgeID>(coarse_edges.size());
         parallel_map.emplace(pins, new_id);
-        coarse_edge_weight.push_back(e.weight());
+        coarse_edge_weight.push_back(edgeWeight(he));
         coarse_edges.emplace_back(std::move(pins));
       } else {
         // parallel net: accumulate weights
-        coarse_edge_weight[it->second] += e.weight();
+        coarse_edge_weight[it->second] += edgeWeight(he);
       }
     }
 
@@ -212,18 +216,21 @@ namespace mt_kahypar::ds {
     hypergraph._total_degree = 0;
     hypergraph._total_weight = 0;
 
-    // Init containers
-    hypergraph._hypernodes.resize(num_coarse_nodes);
-    hypergraph._hyperedges.resize(hypergraph._num_hyperedges);
+    // Init CSR containers
+    hypergraph._hypernode_offsets.assign(num_coarse_nodes, 0);
+    hypergraph._hypernode_enabled.assign(num_coarse_nodes, 1);
+    hypergraph._hyperedge_offsets.assign(hypergraph._num_hyperedges, 0);
+    hypergraph._hyperedge_enabled.assign(hypergraph._num_hyperedges, 1);
     hypergraph._compressed_incidence_array.clear();
     hypergraph._compressed_incident_nets.clear();
+    // Initialize lazy weights
+    hypergraph._hypernode_weights.assign(num_coarse_nodes, 1);
+    hypergraph._hyperedge_weights.assign(hypergraph._num_hyperedges, 1);
 
-    // Enable nodes and set weights; prepare incident nets buckets
+    // Set node weights; prepare incident nets buckets
     std::vector<std::vector<HyperedgeID>> incident_nets(num_coarse_nodes);
     for (HypernodeID u = 0; u < num_coarse_nodes; ++u) {
-      auto& hn = hypergraph._hypernodes[u];
-      hn.enable();
-      hn.setWeight(coarse_node_weight[u]);
+      hypergraph._hypernode_weights[u] = coarse_node_weight[u];
       // firstEntry/compressed sizes set later
     }
 
@@ -231,11 +238,10 @@ namespace mt_kahypar::ds {
     size_t pins_bytes_offset = 0;
     for (HyperedgeID he = 0; he < hypergraph._num_hyperedges; ++he) {
       const auto& pins = coarse_edges[he];
-      auto& out_he = hypergraph._hyperedges[he];
-      out_he.enable();
-      out_he.setFirstEntry(pins_bytes_offset);
-      out_he.setUncompressedSize(pins.size());
-      out_he.setWeight(coarse_edge_weight[he]);
+      hypergraph._hyperedge_offsets[he] = pins_bytes_offset;
+      // header varint for pins size
+      encode_varint(static_cast<uint64_t>(pins.size()), hypergraph._compressed_incidence_array);
+      hypergraph._hyperedge_weights[he] = coarse_edge_weight[he];
 
       // Varint gap-encode pins
       HypernodeID prev = 0;
@@ -244,10 +250,8 @@ namespace mt_kahypar::ds {
         encode_varint(gap, hypergraph._compressed_incidence_array);
         prev = v;
       }
-      const size_t new_end = hypergraph._compressed_incidence_array.size();
-      const size_t written = new_end - pins_bytes_offset;
-      out_he.setCompressedSize(written);
-      pins_bytes_offset = new_end;
+  const size_t new_end = hypergraph._compressed_incidence_array.size();
+  pins_bytes_offset = new_end;
 
       hypergraph._num_pins += static_cast<HypernodeID>(pins.size());
       if (pins.size() > static_cast<size_t>(hypergraph._max_edge_size)) {
@@ -260,17 +264,17 @@ namespace mt_kahypar::ds {
     }
 
     // Encode incident nets per node
-    size_t nets_bytes_offset = 0;
     HypernodeWeight tw = 0;
     for (HypernodeID u = 0; u < num_coarse_nodes; ++u) {
-      auto& hn = hypergraph._hypernodes[u];
       auto& list = incident_nets[u];
 
       std::sort(list.begin(), list.end());
       list.erase(std::unique(list.begin(), list.end()), list.end());
 
-      hn.setFirstEntry(nets_bytes_offset);
-      hn.setUncompressedSize(list.size());
+  // Start position for this node's incident nets
+  hypergraph._hypernode_offsets[u] = hypergraph._compressed_incident_nets.size();
+      // header varint for degree
+      encode_varint(static_cast<uint64_t>(list.size()), hypergraph._compressed_incident_nets);
 
       HyperedgeID prev_e = 0;
       for (HyperedgeID e : list) {
@@ -278,13 +282,9 @@ namespace mt_kahypar::ds {
         encode_varint(gap, hypergraph._compressed_incident_nets);
         prev_e = e;
       }
-      const size_t new_end = hypergraph._compressed_incident_nets.size();
-      const size_t written = new_end - nets_bytes_offset;
-      hn.setCompressedSize(written);
-      nets_bytes_offset = new_end;
 
       hypergraph._total_degree += static_cast<HypernodeID>(list.size());
-      tw += hn.weight();
+      tw += hypergraph._hypernode_weights[u];
     }
     hypergraph._total_weight = tw;
 
@@ -330,23 +330,27 @@ namespace mt_kahypar::ds {
     hypergraph._total_weight = _total_weight;
 
     tbb::parallel_invoke([&] {
-      hypergraph._hypernodes.resize(_hypernodes.size());
-      memcpy(hypergraph._hypernodes.data(), _hypernodes.data(),
-             sizeof(Hypernode) * _hypernodes.size());
+      hypergraph._hypernode_offsets = _hypernode_offsets;
+    }, [&] {
+      hypergraph._hypernode_enabled = _hypernode_enabled;
     }, [&] {
       hypergraph._compressed_incident_nets.resize(_compressed_incident_nets.size());
       memcpy(hypergraph._compressed_incident_nets.data(), _compressed_incident_nets.data(),
              sizeof(uint8_t) * _compressed_incident_nets.size());
     }, [&] {
-      hypergraph._hyperedges.resize(_hyperedges.size());
-      memcpy(hypergraph._hyperedges.data(), _hyperedges.data(),
-             sizeof(Hyperedge) * _hyperedges.size());
+      hypergraph._hyperedge_offsets = _hyperedge_offsets;
+    }, [&] {
+      hypergraph._hyperedge_enabled = _hyperedge_enabled;
     }, [&] {
       hypergraph._compressed_incidence_array.resize(_compressed_incidence_array.size());
       memcpy(hypergraph._compressed_incidence_array.data(), _compressed_incidence_array.data(),
              sizeof(uint8_t) * _compressed_incidence_array.size());
     }, [&] {
       hypergraph._community_ids = _community_ids;
+    }, [&] {
+      hypergraph._hypernode_weights = _hypernode_weights;
+    }, [&] {
+      hypergraph._hyperedge_weights = _hyperedge_weights;
     }, [&] {
       hypergraph.addFixedVertexSupport(_fixed_vertices.copy());
     });
@@ -366,25 +370,25 @@ namespace mt_kahypar::ds {
     hypergraph._total_degree = _total_degree;
     hypergraph._total_weight = _total_weight;
 
-    hypergraph._hypernodes.resize(_hypernodes.size());
-    memcpy(hypergraph._hypernodes.data(), _hypernodes.data(),
-           sizeof(Hypernode) * _hypernodes.size());
+  hypergraph._hypernode_offsets = _hypernode_offsets;
+  hypergraph._hypernode_enabled = _hypernode_enabled;
 
     hypergraph._compressed_incident_nets.resize(_compressed_incident_nets.size());
     // FIX: copy bytes
     memcpy(hypergraph._compressed_incident_nets.data(), _compressed_incident_nets.data(),
            sizeof(uint8_t) * _compressed_incident_nets.size());
 
-    hypergraph._hyperedges.resize(_hyperedges.size());
-    memcpy(hypergraph._hyperedges.data(), _hyperedges.data(),
-           sizeof(Hyperedge) * _hyperedges.size());
+  hypergraph._hyperedge_offsets = _hyperedge_offsets;
+  hypergraph._hyperedge_enabled = _hyperedge_enabled;
 
     hypergraph._compressed_incidence_array.resize(_compressed_incidence_array.size());
     // FIX: copy bytes
     memcpy(hypergraph._compressed_incidence_array.data(), _compressed_incidence_array.data(),
            sizeof(uint8_t) * _compressed_incidence_array.size());
 
-    hypergraph._community_ids = _community_ids;
+  hypergraph._community_ids = _community_ids;
+  hypergraph._hypernode_weights = _hypernode_weights;
+  hypergraph._hyperedge_weights = _hyperedge_weights;
     hypergraph.addFixedVertexSupport(_fixed_vertices.copy());
 
     return hypergraph;
@@ -392,11 +396,11 @@ namespace mt_kahypar::ds {
 
   void CompressedHypergraph::memoryConsumption(utils::MemoryTreeNode* parent) const {
     ASSERT(parent);
-    parent->addChild("Hypernodes", sizeof(Hypernode) * _hypernodes.size());
-    // FIX: account in bytes
+  parent->addChild("Hypernode Offsets", sizeof(size_t) * _hypernode_offsets.capacity());
+  parent->addChild("Hypernode Enabled (bits)", (_hypernode_enabled.capacity() + 7) / 8);
     parent->addChild("Incident Nets", sizeof(uint8_t) * _compressed_incident_nets.size());
-    parent->addChild("Hyperedges", sizeof(Hyperedge) * _hyperedges.size());
-    // FIX: account in bytes
+  parent->addChild("Hyperedge Offsets", sizeof(size_t) * _hyperedge_offsets.capacity());
+  parent->addChild("Hyperedge Enabled (bits)", (_hyperedge_enabled.capacity() + 7) / 8);
     parent->addChild("Incidence Array", sizeof(uint8_t) * _compressed_incidence_array.size());
     parent->addChild("Communities", sizeof(PartitionID) * _community_ids.capacity());
     if ( hasFixedVertices() ) {
@@ -411,7 +415,7 @@ namespace mt_kahypar::ds {
                                            HypernodeWeight weight = init;
                                            for (HypernodeID hn = range.begin(); hn < range.end(); ++hn) {
                                              if (nodeIsEnabled(hn)) {
-                                               weight += this->_hypernodes[hn].weight();
+                                               weight += this->nodeWeight(hn);
                                              }
                                            }
                                            return weight;
