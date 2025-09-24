@@ -134,8 +134,9 @@ namespace mt_kahypar::ds {
     for (HyperedgeID he = 0; he < _num_hyperedges; ++he) {
       if (!edgeIsEnabled(he)) continue;
 
-      const size_t begin = _hyperedge_offsets[he];
-      const size_t end   = hyperedge_firstInvalidEntry(he);
+      auto HE = hyperedge(he);
+      const size_t begin = HE.firstEntry();
+      const size_t end   = HE.firstInvalidEntry();
       size_t pos = begin;
       HypernodeID prev = 0;
 
