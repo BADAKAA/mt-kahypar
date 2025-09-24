@@ -141,8 +141,7 @@ namespace mt_kahypar::ds {
       HypernodeID prev = 0;
 
       std::vector<HypernodeID> pins;
-      // Read header varint for uncompressed edge size and reserve
-      const size_t esize = static_cast<size_t>(decode_varint_bounded(_compressed_incidence_array, pos, end));
+      const size_t esize = static_cast<size_t>(HE.size());
       pins.reserve(esize);
       size_t emitted = 0;
       while (pos < end && emitted < esize) {
@@ -251,8 +250,8 @@ namespace mt_kahypar::ds {
         encode_varint(gap, hypergraph._compressed_incidence_array);
         prev = v;
       }
-  const size_t new_end = hypergraph._compressed_incidence_array.size();
-  pins_bytes_offset = new_end;
+      const size_t new_end = hypergraph._compressed_incidence_array.size();
+      pins_bytes_offset = new_end;
 
       hypergraph._num_pins += static_cast<HypernodeID>(pins.size());
       if (pins.size() > static_cast<size_t>(hypergraph._max_edge_size)) {
@@ -272,8 +271,8 @@ namespace mt_kahypar::ds {
       std::sort(list.begin(), list.end());
       list.erase(std::unique(list.begin(), list.end()), list.end());
 
-  // Start position for this node's incident nets
-  hypergraph._hypernode_offsets[u] = hypergraph._compressed_incident_nets.size();
+      // Start position for this node's incident nets
+      hypergraph._hypernode_offsets[u] = hypergraph._compressed_incident_nets.size();
       // header varint for degree
       encode_varint(static_cast<uint64_t>(list.size()), hypergraph._compressed_incident_nets);
 
@@ -371,25 +370,25 @@ namespace mt_kahypar::ds {
     hypergraph._total_degree = _total_degree;
     hypergraph._total_weight = _total_weight;
 
-  hypergraph._hypernode_offsets = _hypernode_offsets;
-  hypergraph._hypernode_enabled = _hypernode_enabled;
+    hypergraph._hypernode_offsets = _hypernode_offsets;
+    hypergraph._hypernode_enabled = _hypernode_enabled;
 
     hypergraph._compressed_incident_nets.resize(_compressed_incident_nets.size());
     // FIX: copy bytes
     memcpy(hypergraph._compressed_incident_nets.data(), _compressed_incident_nets.data(),
            sizeof(uint8_t) * _compressed_incident_nets.size());
 
-  hypergraph._hyperedge_offsets = _hyperedge_offsets;
-  hypergraph._hyperedge_enabled = _hyperedge_enabled;
+    hypergraph._hyperedge_offsets = _hyperedge_offsets;
+    hypergraph._hyperedge_enabled = _hyperedge_enabled;
 
     hypergraph._compressed_incidence_array.resize(_compressed_incidence_array.size());
     // FIX: copy bytes
     memcpy(hypergraph._compressed_incidence_array.data(), _compressed_incidence_array.data(),
            sizeof(uint8_t) * _compressed_incidence_array.size());
 
-  hypergraph._community_ids = _community_ids;
-  hypergraph._hypernode_weights = _hypernode_weights;
-  hypergraph._hyperedge_weights = _hyperedge_weights;
+    hypergraph._community_ids = _community_ids;
+    hypergraph._hypernode_weights = _hypernode_weights;
+    hypergraph._hyperedge_weights = _hyperedge_weights;
     hypergraph.addFixedVertexSupport(_fixed_vertices.copy());
 
     return hypergraph;
@@ -397,11 +396,11 @@ namespace mt_kahypar::ds {
 
   void CompressedHypergraph::memoryConsumption(utils::MemoryTreeNode* parent) const {
     ASSERT(parent);
-  parent->addChild("Hypernode Offsets", sizeof(size_t) * _hypernode_offsets.capacity());
-  parent->addChild("Hypernode Enabled (bits)", (_hypernode_enabled.capacity() + 7) / 8);
+    parent->addChild("Hypernode Offsets", sizeof(size_t) * _hypernode_offsets.capacity());
+    parent->addChild("Hypernode Enabled (bits)", (_hypernode_enabled.capacity() + 7) / 8);
     parent->addChild("Incident Nets", sizeof(uint8_t) * _compressed_incident_nets.size());
-  parent->addChild("Hyperedge Offsets", sizeof(size_t) * _hyperedge_offsets.capacity());
-  parent->addChild("Hyperedge Enabled (bits)", (_hyperedge_enabled.capacity() + 7) / 8);
+    parent->addChild("Hyperedge Offsets", sizeof(size_t) * _hyperedge_offsets.capacity());
+    parent->addChild("Hyperedge Enabled (bits)", (_hyperedge_enabled.capacity() + 7) / 8);
     parent->addChild("Incidence Array", sizeof(uint8_t) * _compressed_incidence_array.size());
     parent->addChild("Communities", sizeof(PartitionID) * _community_ids.capacity());
     if ( hasFixedVertices() ) {
