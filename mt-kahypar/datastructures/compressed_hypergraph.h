@@ -153,6 +153,7 @@ class CompressedHypergraph {
             && _hg->_compressed_incident_nets[end - 1] == 0x00u
             && (_hg->_compressed_incident_nets[end - 2] & 0x80) == 0
         ) end--;
+        if (end == start + 1 && this->degree() == 0) return start; // edge case: only padding bytes
         return end;
     }
     HyperedgeID degree() const {
@@ -217,6 +218,7 @@ class CompressedHypergraph {
             && _hg->_compressed_incidence_array[end - 1] == 0x00u
             && (_hg->_compressed_incidence_array[end - 2] & 0x80) == 0
         ) end--;
+        if (end == start + 1 && this->size() == 0) return start; // edge case: only padding bytes
         return end;
     }
     HypernodeID size() const {
@@ -896,6 +898,7 @@ public:
 
     // ####################### Remove / Restore Hyperedges #######################
 
+    // To avoid rebuilding the entire _compressed_incident_nets, 0x00 padding bytes are left in place.
     void removeEdge(const HyperedgeID he) {
         ASSERT(edgeIsEnabled(he), "Hyperedge" << he << "is disabled");
 
@@ -949,6 +952,7 @@ public:
         disableHyperedge(he);
     }
 
+    // To avoid rebuilding the entire _compressed_incident_nets, 0x00 padding bytes are left in place.
     void removeLargeEdge(const HyperedgeID he) {
         ASSERT(edgeIsEnabled(he), "Hyperedge" << he << "is disabled");
 
@@ -1244,7 +1248,7 @@ private:
         ASSERT(edgeIsEnabled(e), "Hyperedge" << e << "is disabled");
         const auto he = hyperedge(e);
         ASSERT(local_pos < he.size());
-        // Decode varints up to local_pos, skipping zero-gap placeholders
+        // Decode varints up to local_pos, skipping zero-gap padding bytes
         size_t cur = he.firstEntry();
         const size_t end = he.firstInvalidEntry();
         [[maybe_unused]] const size_t esize = static_cast<size_t>(he.size());
