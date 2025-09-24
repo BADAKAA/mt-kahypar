@@ -8,6 +8,7 @@
 namespace fs = std::filesystem;
 
 #include <iostream>
+#include <algorithm>
 
 #include "mt-kahypar/definitions.h"
 #include "mt-kahypar/io/command_line_options.h"
@@ -26,22 +27,116 @@ namespace fs = std::filesystem;
 #include "mt-kahypar/utils/randomize.h"
 #include "mt-kahypar/utils/utilities.h"
 
+#include "mt-kahypar/datastructures/compressed_hypergraph.h"
+#include "mt-kahypar/datastructures/static_hypergraph.h"
+
 using namespace mt_kahypar;
+
+// Simple partition quality estimator for comparisons between static and compressed outputs.
+// We mimic common objectives without depending on metrics.h:
+// - cut: sum edge weight for edges with connectivity > 1
+// - km1: sum (connectivity - 1) * edge weight
+// - soed: sum connectivity * edge weight for edges with connectivity > 1
+// - steiner_tree: approximate via (connectivity - 1) * edge weight
+template <typename PartitionedHypergraphT>
+static inline HyperedgeWeight simple_partition_quality(const PartitionedHypergraphT& phg,
+                                                       const Objective objective) {
+    HyperedgeWeight total = 0;
+    switch (objective) {
+        case Objective::cut: {
+            for (const HyperedgeID he : phg.edges()) {
+                const PartitionID c = phg.connectivity(he);
+                if (c > 1) total += phg.edgeWeight(he);
+            }
+            break;
+        }
+        case Objective::km1: {
+            for (const HyperedgeID he : phg.edges()) {
+                const PartitionID c = phg.connectivity(he);
+                if (c > 1) total += static_cast<HyperedgeWeight>((c - 1)) * phg.edgeWeight(he);
+            }
+            break;
+        }
+        case Objective::soed: {
+            for (const HyperedgeID he : phg.edges()) {
+                const PartitionID c = phg.connectivity(he);
+                if (c > 1) total += static_cast<HyperedgeWeight>(c) * phg.edgeWeight(he);
+            }
+            break;
+        }
+        case Objective::steiner_tree: {
+            // Cheap approximation without target graph: treat like km1
+            for (const HyperedgeID he : phg.edges()) {
+                const PartitionID c = phg.connectivity(he);
+                if (c > 1) total += static_cast<HyperedgeWeight>((c - 1)) * phg.edgeWeight(he);
+            }
+            break;
+        }
+        default: break;
+    }
+    // Graphs store each edge twice; hypergraphs do not. Mirror metrics behavior.
+    if constexpr (PartitionedHypergraphT::is_graph) {
+        total /= 2;
+    }
+    return total;
+}
+
+static inline HyperedgeWeight compute_partition_quality_estimate(
+    const mt_kahypar_partitioned_hypergraph_t& phg_handle, const Context& context) {
+    switch (phg_handle.type) {
+        case MULTILEVEL_HYPERGRAPH_PARTITIONING: {
+            const StaticPartitionedHypergraph& phg =
+                utils::cast<StaticPartitionedHypergraph>(phg_handle);
+            return simple_partition_quality(phg, context.partition.objective);
+        }
+        case COMPRESSED_MULTILEVEL_HYPERGRAPH_PARTITIONING: {
+            const CompressedPartitionedHypergraph& phg =
+                utils::cast<CompressedPartitionedHypergraph>(phg_handle);
+            return simple_partition_quality(phg, context.partition.objective);
+        }
+        #ifdef KAHYPAR_ENABLE_HIGHEST_QUALITY_FEATURES
+        case N_LEVEL_HYPERGRAPH_PARTITIONING: {
+            const DynamicPartitionedHypergraph& phg =
+                utils::cast<DynamicPartitionedHypergraph>(phg_handle);
+            return simple_partition_quality(phg, context.partition.objective);
+        }
+        #endif
+        #ifdef KAHYPAR_ENABLE_GRAPH_PARTITIONING_FEATURES
+        case MULTILEVEL_GRAPH_PARTITIONING: {
+            const StaticPartitionedGraph& pg = utils::cast<StaticPartitionedGraph>(phg_handle);
+            return simple_partition_quality(pg, context.partition.objective);
+        }
+        case N_LEVEL_GRAPH_PARTITIONING: {
+            const DynamicPartitionedGraph& pg = utils::cast<DynamicPartitionedGraph>(phg_handle);
+            return simple_partition_quality(pg, context.partition.objective);
+        }
+        #endif
+        #ifdef KAHYPAR_ENABLE_LARGE_K_PARTITIONING_FEATURES
+        case LARGE_K_PARTITIONING:
+        #endif
+        case NULLPTR_PARTITION:
+        default:
+        break;
+    }
+    return 0;
+}
 
 void write_csv_header(const std::string& csv_path) {
     std::ofstream outfile(csv_path, std::ios::trunc);  // Overwrite if exists
     outfile << "FileName,NodeCount,HyperedgeCount,IOTimeMS,PartitionTimeMS,"
-               "MemoryUsage,Compressed"
+               "MemoryUsage,PartitionQuality,Compressed"
             << std::endl;
 }
 
 void append_csv_line(const std::string& csv_path, const std::string& filename,
                      size_t num_nodes, size_t num_hyperedges, size_t io_time,
                      size_t partition_time, size_t memory_usage,
+                     HyperedgeWeight partition_quality,
                      bool compressed) {
     std::ofstream outfile(csv_path, std::ios::app);
     outfile << filename << "," << num_nodes << "," << num_hyperedges << ","
             << io_time << "," << partition_time << "," << memory_usage << ","
+            << partition_quality << ","
             << (compressed ? "1" : "0") << std::endl;
 }
 
@@ -56,7 +151,6 @@ void partition_graph(const std::string& filename, const Context& base_context,
       context.partition.max_part_weights.clear();
     }
 
-    context.partition.verbose_output = false;
     context.partition.graph_filename = filename;
     context.partition.instance_type = compressed
                                           ? InstanceType::compressed_hypergraph
@@ -147,6 +241,10 @@ void partition_graph(const std::string& filename, const Context& base_context,
     end = std::chrono::high_resolution_clock::now();
 
 		size_t partition_time = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    // Compute a simple partition quality estimate (no dependency on metrics.h)
+    const HyperedgeWeight partition_quality_estimate =
+        compute_partition_quality_estimate(partitioned_hypergraph, context);
+
     // Print Stats
     std::chrono::duration<double> elapsed_seconds(end - start);
     PartitionerFacade::printPartitioningResults(partitioned_hypergraph, context,
@@ -170,12 +268,14 @@ void partition_graph(const std::string& filename, const Context& base_context,
             utils::cast<ds::CompressedHypergraph>(hypergraph);
         append_csv_line(OUTPUT_PATH, filename, hg.initialNumNodes(),
                         hg.initialNumEdges(), io_time, partition_time, hg.memoryConsumptionKB(),
+                        partition_quality_estimate,
                         compressed);
     } else {
         const ds::StaticHypergraph& hg =
             utils::cast<ds::StaticHypergraph>(hypergraph);
         append_csv_line(OUTPUT_PATH, filename, hg.initialNumNodes(),
                         hg.initialNumEdges(), io_time, partition_time, hg.memoryConsumptionKB(),
+                        partition_quality_estimate,
                         compressed);
     }
 
@@ -206,6 +306,7 @@ void print_progress(size_t current, size_t total) {
 int main(int argc, char* argv[]) {
     Context base(false);
     processCommandLineInput(base, argc, argv, nullptr);
+    base.partition.verbose_output = false;
 
     fs::create_directories("./__out");
 
@@ -213,7 +314,7 @@ int main(int argc, char* argv[]) {
 
     write_csv_header(OUTPUT_PATH);
 
-    const std::string directory = "./_graphs/test";
+    const std::string directory = "./_graphs/benchmark_set_d";
 
     // Collect all regular files first
     std::vector<fs::path> files;
@@ -235,7 +336,7 @@ int main(int argc, char* argv[]) {
         partition_graph(path.string(), base, OUTPUT_PATH);
         print_progress(++count, total);
     }
-    std::cout << std::endl << "Partitioning Compressed Graphs" << std::endl;
+    std::cout << std::endl << std::endl <<  "Partitioning Compressed Graphs" << std::endl;
     count = 0;
     print_progress(count, total);
     for (const auto& path : files) {
