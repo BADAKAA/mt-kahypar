@@ -64,9 +64,14 @@ class BitVector {
   // Append one bit
   void push_back(bool value) {
     const size_t idx = _size_bits;
-    ensure_index(idx);
+    // Ensure underlying storage has capacity for this bit but do not
+    // change logical size until after writing the bit.
+    const size_t wi = word_index(idx);
+    if (wi >= _words.size()) {
+      _words.resize(wi + 1, 0ULL);
+    }
     if (value) {
-      _words[word_index(idx)] |= bit_mask(idx);
+      _words[wi] |= bit_mask(idx);
     }
     ++_size_bits;
   }
@@ -74,11 +79,11 @@ class BitVector {
   // Assign n bits all to value
   void assign(size_t n, bool value) {
     _size_bits = n;
-    const size_t needed_words = words_for_bits(n);
+    const size_t needed_words = words_for_bits(_size_bits);
     _words.assign(needed_words, value ? ~uint64_t(0) : uint64_t(0));
     // Mask off unused high bits in last word
     if (needed_words > 0) {
-      const size_t rem = (n & 63ULL);
+      const size_t rem = (_size_bits & 63ULL);
       if (rem != 0) {
         const uint64_t mask = (uint64_t(1) << rem) - 1ULL;
         _words.back() &= mask;

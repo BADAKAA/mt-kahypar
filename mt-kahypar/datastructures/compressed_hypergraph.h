@@ -148,7 +148,11 @@ class CompressedHypergraph {
     size_t firstInvalidEntry() const {
         const size_t start = firstEntry();
         size_t end = nextNodePos();
-        while (end > start && _hg->_compressed_incident_nets[end - 1] == 0x00u) end--;
+        while (
+            end > (start + 1)
+            && _hg->_compressed_incident_nets[end - 1] == 0x00u
+            && (_hg->_compressed_incident_nets[end - 2] & 0x80) == 0
+        ) end--;
         return end;
     }
     HyperedgeID degree() const {
@@ -208,7 +212,11 @@ class CompressedHypergraph {
     size_t firstInvalidEntry() const {
         const size_t start = firstEntry();
         size_t end = nextEdgePos();
-        while (end > start && _hg->_compressed_incidence_array[end - 1] == 0x00u) end--;
+        while (
+            end > (start + 1)
+            && _hg->_compressed_incidence_array[end - 1] == 0x00u
+            && (_hg->_compressed_incidence_array[end - 2] & 0x80) == 0
+        ) end--;
         return end;
     }
     HypernodeID size() const {
@@ -513,12 +521,14 @@ public:
                 // skip zero-gap placeholders except possibly the very first emitted element
                 if (_emitted > 0 && gap == 0) { continue; }
                 _acc += static_cast<HyperedgeID>(gap);
-                // consume one logical entry regardless of enabled
-                --_left; ++_emitted;
                 if (_acc < _max && (_enabled == nullptr || (*_enabled)[_acc])) {
-                    _cur = _acc; _has = true; return;
+                    _cur = _acc;
+                    _has = true;
+                    --_left;
+                    ++_emitted;
+                    return;
                 }
-                // else: skip invalid ID and continue
+                // else: skip invalid ID and continue without consuming logical count
             }
             // exhausted
             _has = false;
@@ -723,6 +733,7 @@ public:
         const size_t begin = he.firstEntry();
         const size_t end = he.firstInvalidEntry();
         const size_t esize = static_cast<size_t>(he.size());
+
         return IteratorRange<IncidenceIterator>(
             IncidenceIterator(_compressed_incidence_array, begin, end, esize),
             IncidenceIterator(_compressed_incidence_array, end));
@@ -1317,19 +1328,7 @@ private:
         return acc;
     }
 
-    // Computes end offset for hyperedge e using neighbor begin or array end; then trims trailing zeros.
-    MT_KAHYPAR_ATTRIBUTE_ALWAYS_INLINE size_t hyperedge_firstInvalidEntry(const HyperedgeID e) const {
-        ASSERT(e < _num_hyperedges);
-        const size_t end = (e + 1 < _num_hyperedges) ? _hyperedge_offsets[e + 1] : _compressed_incidence_array.size();
-        return end;
-    }
 
-    // Computes end offset for hypernode u using neighbor begin or array end; then trims trailing zeros.
-    MT_KAHYPAR_ATTRIBUTE_ALWAYS_INLINE size_t hypernode_firstInvalidEntry(const HypernodeID u) const {
-        ASSERT(u < _num_hypernodes);
-        const size_t end = (u + 1 < _num_hypernodes) ? _hypernode_offsets[u + 1] : _compressed_incident_nets.size();
-        return end;
-    }
 
     void allocateTmpContractionBuffer() {
         if (!_tmp_contraction_buffer) {
