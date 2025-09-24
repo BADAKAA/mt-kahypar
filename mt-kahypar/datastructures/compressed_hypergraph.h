@@ -422,7 +422,7 @@ public:
 
     // Iterator types (ID-based over enabled flags)
     // Note: legacy element iterator from other hypergraph variants is not used here
-    // Pins of a hyperedge are HypernodeID (degree-bounded, skip zero-gap placeholders)
+    // Pins of a hyperedge are HypernodeID (degree-bounded, skip zero-gap padding bytes)
     class PinsIterator {
     public:
         using iterator_category = std::forward_iterator_tag;
@@ -930,9 +930,16 @@ public:
             const size_t begin = HN.firstEntry();
             const size_t end = HN.firstInvalidEntry();
             // Decode current incidents
-            std::vector<HyperedgeID> inc; inc.reserve(nodeDegree(u));
-            size_t cur = begin; HyperedgeID acc = 0;
-            while (cur < end) { const uint64_t gap = decode_varint_bounded(_compressed_incident_nets, cur, end); acc += static_cast<HyperedgeID>(gap); if (acc != he && acc < _num_hyperedges) inc.push_back(acc); }
+            const size_t expected = static_cast<size_t>(HN.degree());
+            std::vector<HyperedgeID> inc; inc.reserve(expected);
+            size_t cur = begin; HyperedgeID acc = 0; size_t emitted = 0;
+            while (cur < end && emitted < expected) {
+                const uint64_t gap = decode_varint_bounded(_compressed_incident_nets, cur, end);
+                if (emitted > 0 && gap == 0) { continue; }
+                acc += static_cast<HyperedgeID>(gap);
+                if (acc != he && acc < _num_hyperedges) inc.push_back(acc);
+                ++emitted;
+            }
             // Re-encode
             std::vector<uint8_t> bytes;
             std::sort(inc.begin(), inc.end()); inc.erase(std::unique(inc.begin(), inc.end()), inc.end());
@@ -951,7 +958,7 @@ public:
         ++_num_removed_hyperedges;
         disableHyperedge(he);
     }
-
+    
     // To avoid rebuilding the entire _compressed_incident_nets, 0x00 padding bytes are left in place.
     void removeLargeEdge(const HyperedgeID he) {
         ASSERT(edgeIsEnabled(he), "Hyperedge" << he << "is disabled");
@@ -984,9 +991,16 @@ public:
             const size_t begin = HN.firstEntry();
             const size_t end = HN.firstInvalidEntry();
             // Decode incidents
-            std::vector<HyperedgeID> inc; inc.reserve(nodeDegree(u));
-            size_t cur = begin; HyperedgeID acc = 0;
-            while (cur < end) { const uint64_t gap = decode_varint_bounded(_compressed_incident_nets, cur, end); acc += static_cast<HyperedgeID>(gap); if (acc != he && acc < _num_hyperedges) inc.push_back(acc); }
+            const size_t expected = static_cast<size_t>(HN.degree());
+            std::vector<HyperedgeID> inc; inc.reserve(expected);
+            size_t cur = begin; HyperedgeID acc = 0; size_t emitted = 0;
+            while (cur < end && emitted < expected) {
+                const uint64_t gap = decode_varint_bounded(_compressed_incident_nets, cur, end);
+                if (emitted > 0 && gap == 0) { continue; }
+                acc += static_cast<HyperedgeID>(gap);
+                if (acc != he && acc < _num_hyperedges) inc.push_back(acc);
+                ++emitted;
+            }
             std::vector<uint8_t> bytes;
             std::sort(inc.begin(), inc.end()); inc.erase(std::unique(inc.begin(), inc.end()), inc.end());
             encode_varint(static_cast<uint64_t>(inc.size()), bytes);
@@ -1014,12 +1028,14 @@ public:
         pins_of_he.reserve(HE.size());
         {
             HypernodeID acc = 0;
-            // skip header varint (edge size)
-            (void)decode_varint_bounded(_compressed_incidence_array, he_pos, he_end);
-            while (he_pos < he_end) {
+            size_t emitted = 0;
+            const size_t expected = static_cast<size_t>(HE.size());
+            while (he_pos < he_end && emitted < expected) {
                 const uint64_t gap = decode_varint_bounded(_compressed_incidence_array, he_pos, he_end);
+                if (emitted > 0 && gap == 0) { continue; }
                 acc += static_cast<HypernodeID>(gap);
                 pins_of_he.push_back(acc);
+                ++emitted;
             }
         }
 
@@ -1033,10 +1049,17 @@ public:
             const size_t header_begin = _hypernode_offsets[u];
             const size_t begin = HN.firstEntry();
             const size_t end = HN.firstInvalidEntry();
-            // Decode existing incidents
-            std::vector<HyperedgeID> inc; inc.reserve(nodeDegree(u) + 1);
-            size_t cur = begin; HyperedgeID acc = 0;
-            while (cur < end) { const uint64_t g = decode_varint_bounded(_compressed_incident_nets, cur, end); acc += static_cast<HyperedgeID>(g); if (acc < _num_hyperedges) inc.push_back(acc); }
+            // Decode existing incidents (bounded by stored degree and skipping zero-gap padding)
+            const size_t expected = static_cast<size_t>(HN.degree());
+            std::vector<HyperedgeID> inc; inc.reserve(expected + 1);
+            size_t cur = begin; HyperedgeID acc = 0; size_t emitted = 0;
+            while (cur < end && emitted < expected) {
+                const uint64_t g = decode_varint_bounded(_compressed_incident_nets, cur, end);
+                if (emitted > 0 && g == 0) { continue; }
+                acc += static_cast<HyperedgeID>(g);
+                if (acc < _num_hyperedges) inc.push_back(acc);
+                ++emitted;
+            }
             // Insert he and encode
             inc.push_back(he);
             std::sort(inc.begin(), inc.end()); inc.erase(std::unique(inc.begin(), inc.end()), inc.end());
@@ -1071,9 +1094,18 @@ public:
             // Helper to decode an untouched node from snapshot and encode again
             auto encode_from_snapshot = [&](HypernodeID u) {
                 std::vector<HyperedgeID> inc; size_t cur = old_begin[u]; const size_t end = old_end[u];
-                (void)decode_varint_bounded(_compressed_incident_nets, cur, end);
-                HyperedgeID acc = 0;
-                while (cur < end) { const uint64_t g = decode_varint_bounded(_compressed_incident_nets, cur, end); acc += static_cast<HyperedgeID>(g); if (acc < _num_hyperedges) inc.push_back(acc); }
+                // header varint starts at old_begin[u], decode it to know how many to read
+                size_t header_pos = cur;
+                const size_t degree = static_cast<size_t>(decode_varint_bounded(_compressed_incident_nets, header_pos, end));
+                cur = header_pos;
+                HyperedgeID acc = 0; size_t emitted = 0;
+                while (cur < end && emitted < degree) {
+                    const uint64_t g = decode_varint_bounded(_compressed_incident_nets, cur, end);
+                    if (emitted > 0 && g == 0) { continue; }
+                    acc += static_cast<HyperedgeID>(g);
+                    if (acc < _num_hyperedges) inc.push_back(acc);
+                    ++emitted;
+                }
                 std::vector<uint8_t> out; if (!inc.empty()) { std::sort(inc.begin(), inc.end()); inc.erase(std::unique(inc.begin(), inc.end()), inc.end()); encode_varint(static_cast<uint64_t>(inc.size()), out); HyperedgeID prev = 0; for (HyperedgeID x : inc) { ASSERT(x >= prev); encode_varint(static_cast<uint64_t>(x - prev), out); prev = x; } }
                 return out;
             };
