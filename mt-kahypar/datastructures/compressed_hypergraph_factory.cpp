@@ -84,22 +84,6 @@ static inline size_t push_varint(std::vector<uint8_t>& out, size_t x) {
   return blocks;
 }
 
-size_t get_last_varint(std::vector<uint8_t>& vec) {
-  if (vec.empty()) return 0;
-  size_t pos = vec.size() - 1;
-  size_t result = 0;
-  int shift = 0;
-  while (true) {
-    uint8_t byte = vec[pos];
-    result |= (static_cast<size_t>(byte & 0x7Fu) << shift);
-    if ((byte & 0x80u) == 0) break;
-    if (pos == 0) throw InvalidInputException("Malformed varint in vector");
-    --pos;
-    shift += 7;
-  }
-  return result;
-}
-
 CompressedHypergraph CompressedHypergraphFactory::stream(const std::string& filename, const bool remove_single_pin_hes) {
   std::ifstream in(filename);
   if (!in) throw mt_kahypar::SystemException("Cannot open file: " + filename);
