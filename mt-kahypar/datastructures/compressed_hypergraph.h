@@ -903,22 +903,23 @@ public:
         size_t he_pos = HE.firstEntry();
         const size_t he_end = HE.firstInvalidEntry();
         std::vector<HypernodeID> pins_of_he;
-        pins_of_he.reserve(edgeSize(he));
+        const size_t esize = static_cast<size_t>(HE.size());
+        pins_of_he.reserve(esize);
         {
             HypernodeID acc = 0;
-            // skip header varint (edge size)
-            (void)decode_varint_bounded(_compressed_incidence_array, he_pos, he_end);
-            while (he_pos < he_end) {
+            size_t emitted = 0;
+            while (he_pos < he_end && emitted < esize) {
                 const uint64_t gap = decode_varint_bounded(_compressed_incidence_array, he_pos, he_end);
+                if (emitted > 0 && gap == 0) { continue; }
                 acc += static_cast<HypernodeID>(gap);
                 pins_of_he.push_back(acc);
+                ++emitted;
             }
         }
 
-        // For each pin, attempt in-place shrink; if any overflow, fallback to repack
-        struct PendingUpdate { HypernodeID u; std::vector<uint8_t> bytes; size_t begin; size_t cap; };
+        // For each pin, compute new bytes and overwrite in-place
+        struct PendingUpdate { HypernodeID u; std::vector<uint8_t> bytes; size_t begin; };
         std::vector<PendingUpdate> pending; pending.reserve(pins_of_he.size());
-        bool needs_repack = false;
         for (const HypernodeID u : pins_of_he) {
             if (!nodeIsEnabled(u)) continue;
             const auto HN = hypernode(u);
@@ -934,49 +935,14 @@ public:
             std::sort(inc.begin(), inc.end()); inc.erase(std::unique(inc.begin(), inc.end()), inc.end());
             encode_varint(static_cast<uint64_t>(inc.size()), bytes); // header
             HyperedgeID prev = 0; for (HyperedgeID x : inc) { ASSERT(x >= prev); encode_varint(static_cast<uint64_t>(x - prev), bytes); prev = x; }
-            // Capacity up to next enabled node
-            size_t next_begin = (u+1 < _num_hypernodes) ? _hypernode_offsets[u + 1] : _compressed_incident_nets.size();
-            const size_t cap = next_begin - header_begin;
-            if (bytes.size() > cap) needs_repack = true;
-            pending.push_back(PendingUpdate{u, std::move(bytes), header_begin, cap});
+            pending.push_back(PendingUpdate{u, std::move(bytes), header_begin});
         }
 
-        if (!needs_repack) {
-            for (auto& up : pending) {
-                if (!up.bytes.empty()) {
-                    std::copy(up.bytes.begin(), up.bytes.end(), _compressed_incident_nets.begin() + up.begin);
-                }
+        // In-place overwrite; we intentionally leave any trailing unused bytes as-is
+        for (auto& up : pending) {
+            if (!up.bytes.empty()) {
+                std::copy(up.bytes.begin(), up.bytes.end(), _compressed_incident_nets.begin() + up.begin);
             }
-        } else {
-            // Repack only if absolutely necessary (rare due to varint edge cases)
-            std::unordered_map<HypernodeID, std::vector<uint8_t>> overrides;
-            overrides.reserve(pending.size());
-            for (const auto& up : pending) { overrides.emplace(up.u, up.bytes); }
-            // Snapshot current begins/ends
-            std::vector<size_t> old_begin(_num_hypernodes), old_end(_num_hypernodes);
-            for (HypernodeID u = 0; u < _num_hypernodes; ++u) { old_begin[u] = _hypernode_offsets[u]; old_end[u] = hypernode(u).firstInvalidEntry(); }
-            auto encode_from_snapshot = [&](HypernodeID u) {
-                std::vector<HyperedgeID> inc; size_t cur = old_begin[u]; const size_t end = old_end[u];
-                (void)decode_varint_bounded(_compressed_incident_nets, cur, end);
-                HyperedgeID acc = 0;
-                while (cur < end) { const uint64_t g = decode_varint_bounded(_compressed_incident_nets, cur, end); acc += static_cast<HyperedgeID>(g); if (acc < _num_hyperedges) inc.push_back(acc); }
-                std::vector<uint8_t> out; std::sort(inc.begin(), inc.end()); inc.erase(std::unique(inc.begin(), inc.end()), inc.end());
-                encode_varint(static_cast<uint64_t>(inc.size()), out);
-                HyperedgeID prev = 0; for (HyperedgeID x : inc) { ASSERT(x >= prev); encode_varint(static_cast<uint64_t>(x - prev), out); prev = x; }
-                return out;
-            };
-            CompressedIncidentNets new_incident_nets; new_incident_nets.reserve(_compressed_incident_nets.size());
-            size_t write_pos = 0;
-            for (HypernodeID u = 0; u < _num_hypernodes; ++u) {
-                if (!nodeIsEnabled(u)) continue;
-                _hypernode_offsets[u] = write_pos;
-                std::vector<uint8_t> bytes;
-                auto it = overrides.find(u);
-                if (it != overrides.end()) { bytes = it->second; } else { bytes = encode_from_snapshot(u); }
-                new_incident_nets.insert(new_incident_nets.end(), bytes.begin(), bytes.end());
-                write_pos += bytes.size();
-            }
-            _compressed_incident_nets.swap(new_incident_nets);
         }
 
         ++_num_removed_hyperedges;
@@ -990,22 +956,23 @@ public:
         size_t he_pos = HE.firstEntry();
         const size_t he_end = HE.firstInvalidEntry();
         std::vector<HypernodeID> pins_of_he;
-        pins_of_he.reserve(edgeSize(he));
+        const size_t esize = static_cast<size_t>(HE.size());
+        pins_of_he.reserve(esize);
         {
             HypernodeID acc = 0;
-            // skip header varint (edge size)
-            (void)decode_varint_bounded(_compressed_incidence_array, he_pos, he_end);
-            while (he_pos < he_end) {
+            size_t emitted = 0;
+            while (he_pos < he_end && emitted < esize) {
                 const uint64_t gap = decode_varint_bounded(_compressed_incidence_array, he_pos, he_end);
+                if (emitted > 0 && gap == 0) { continue; }
                 acc += static_cast<HypernodeID>(gap);
                 pins_of_he.push_back(acc);
+                ++emitted;
             }
         }
 
-        // Attempt in-place shrink for each affected node; fallback to repack if any overflow
-        struct PendingUpdateLE { HypernodeID u; std::vector<uint8_t> bytes; size_t begin; size_t cap; };
+        // Compute new bytes for each affected node and overwrite in-place
+        struct PendingUpdateLE { HypernodeID u; std::vector<uint8_t> bytes; size_t begin; };
         std::vector<PendingUpdateLE> updates; updates.reserve(pins_of_he.size());
-        bool needs_repack = false;
         for (const HypernodeID u : pins_of_he) {
             if (!nodeIsEnabled(u)) continue;
             const auto HN = hypernode(u);
@@ -1020,46 +987,12 @@ public:
             std::sort(inc.begin(), inc.end()); inc.erase(std::unique(inc.begin(), inc.end()), inc.end());
             encode_varint(static_cast<uint64_t>(inc.size()), bytes);
             HyperedgeID prev = 0; for (HyperedgeID x : inc) { ASSERT(x >= prev); encode_varint(static_cast<uint64_t>(x - prev), bytes); prev = x; }
-            size_t next_begin = (u+1 < _num_hypernodes) ? _hypernode_offsets[u + 1] : _compressed_incident_nets.size();
-            const size_t cap = next_begin - header_begin;
-            if (bytes.size() > cap) needs_repack = true;
-            updates.push_back(PendingUpdateLE{u, std::move(bytes), header_begin, cap});
+            updates.push_back(PendingUpdateLE{u, std::move(bytes), header_begin});
         }
-        if (!needs_repack) {
-            for (auto& up : updates) {
-                if (!up.bytes.empty()) {
-                    std::copy(up.bytes.begin(), up.bytes.end(), _compressed_incident_nets.begin() + up.begin);
-                }
+        for (auto& up : updates) {
+            if (!up.bytes.empty()) {
+                std::copy(up.bytes.begin(), up.bytes.end(), _compressed_incident_nets.begin() + up.begin);
             }
-        } else {
-            // Repack fallback
-            std::unordered_map<HypernodeID, std::vector<uint8_t>> overrides;
-            overrides.reserve(updates.size());
-            for (const auto& up : updates) { overrides.emplace(up.u, up.bytes); }
-            std::vector<size_t> old_begin(_num_hypernodes), old_end(_num_hypernodes);
-            for (HypernodeID u = 0; u < _num_hypernodes; ++u) { old_begin[u] = _hypernode_offsets[u]; old_end[u] = hypernode(u).firstInvalidEntry(); }
-            auto encode_from_snapshot = [&](HypernodeID u) {
-                std::vector<HyperedgeID> inc; size_t cur = old_begin[u]; const size_t end = old_end[u];
-                (void)decode_varint_bounded(_compressed_incident_nets, cur, end);
-                HyperedgeID acc = 0;
-                while (cur < end) { const uint64_t g = decode_varint_bounded(_compressed_incident_nets, cur, end); acc += static_cast<HyperedgeID>(g); if (acc < _num_hyperedges) inc.push_back(acc); }
-                std::vector<uint8_t> out; std::sort(inc.begin(), inc.end()); inc.erase(std::unique(inc.begin(), inc.end()), inc.end());
-                encode_varint(static_cast<uint64_t>(inc.size()), out);
-                HyperedgeID prev = 0; for (HyperedgeID x : inc) { ASSERT(x >= prev); encode_varint(static_cast<uint64_t>(x - prev), out); prev = x; }
-                return out;
-            };
-            CompressedIncidentNets new_incident_nets; new_incident_nets.reserve(_compressed_incident_nets.size());
-            size_t write_pos = 0;
-            for (HypernodeID u = 0; u < _num_hypernodes; ++u) {
-                if (!nodeIsEnabled(u)) continue;
-                _hypernode_offsets[u] = write_pos;
-                std::vector<uint8_t> bytes;
-                auto it = overrides.find(u);
-                if (it != overrides.end()) { bytes = it->second; } else { bytes = encode_from_snapshot(u); }
-                new_incident_nets.insert(new_incident_nets.end(), bytes.begin(), bytes.end());
-                write_pos += bytes.size();
-            }
-            _compressed_incident_nets.swap(new_incident_nets);
         }
 
         // Mirror static semantics: do not change removed count
@@ -1074,7 +1007,7 @@ public:
         size_t he_pos = HE.firstEntry();
         const size_t he_end = HE.firstInvalidEntry();
         std::vector<HypernodeID> pins_of_he;
-        pins_of_he.reserve(edgeSize(he));
+        pins_of_he.reserve(HE.size());
         {
             HypernodeID acc = 0;
             // skip header varint (edge size)
@@ -1087,7 +1020,7 @@ public:
         }
 
         // First pass: compute new bytes per affected node and check if in-place growth fits
-    struct PendingUpdate { HypernodeID u; std::vector<uint8_t> bytes; size_t begin; size_t cap; };
+        struct PendingUpdate { HypernodeID u; std::vector<uint8_t> bytes; size_t begin; size_t cap; };
         std::vector<PendingUpdate> pending; pending.reserve(pins_of_he.size());
         bool needs_repack = false;
         for (const HypernodeID u : pins_of_he) {
