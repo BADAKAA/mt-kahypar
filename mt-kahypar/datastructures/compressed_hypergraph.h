@@ -44,6 +44,7 @@
 #include "mt-kahypar/utils/exception.h"
 #include "mt-kahypar/parallel/stl/scalable_vector.h"
 #include "mt-kahypar/datastructures/bit_vector.h"
+#include "mt-kahypar/parallel/atomic_wrapper.h"
 
 namespace mt_kahypar {
 namespace ds {
@@ -385,28 +386,40 @@ class CompressedHypergraph {
     // Contains buffers needed during contractions
     struct TmpContractionBuffer {
         explicit TmpContractionBuffer(const HypernodeID num_hypernodes,
-                                    const HyperedgeID num_hyperedges,
-                                    const HyperedgeID num_pins) {
-            mapping.resize(num_hypernodes);
-            tmp_hypernodes.resize(num_hypernodes);
-            tmp_incident_nets.resize(num_pins);
-            tmp_num_incident_nets.resize(num_hypernodes);
-            hn_weights.resize(num_hypernodes);
-            tmp_hyperedges.resize(num_hyperedges);
-            tmp_incidence_array.resize(num_pins);
-            he_sizes.resize(num_hyperedges);
-            valid_hyperedges.resize(num_hyperedges);
+                                      const HyperedgeID num_hyperedges,
+                                      const HyperedgeID num_pins) {
+            // Allocate through memory pool-backed Arrays to reduce peak RSS and fragmentation
+            tbb::parallel_invoke([&] {
+                mapping.resize("Coarsening", "mapping", num_hypernodes);
+            }, [&] {
+                tmp_hypernodes.resize("Coarsening", "tmp_hypernodes", num_hypernodes);
+            }, [&] {
+                tmp_incident_nets.resize("Coarsening", "tmp_incident_nets", num_pins);
+            }, [&] {
+                tmp_num_incident_nets.resize("Coarsening", "tmp_num_incident_nets", num_hypernodes);
+            }, [&] {
+                hn_weights.resize("Coarsening", "hn_weights", num_hypernodes);
+            }, [&] {
+                tmp_hyperedges.resize("Coarsening", "tmp_hyperedges", num_hyperedges);
+            }, [&] {
+                tmp_incidence_array.resize("Coarsening", "tmp_incidence_array", num_pins);
+            }, [&] {
+                he_sizes.resize("Coarsening", "he_sizes", num_hyperedges);
+            }, [&] {
+                valid_hyperedges.resize("Coarsening", "valid_hyperedges", num_hyperedges);
+            });
         }
 
-        std::vector<HypernodeID> mapping;
-        std::vector<Hypernode> tmp_hypernodes;
-        CompressedIncidentNets tmp_incident_nets;
-        std::vector<HyperedgeID> tmp_num_incident_nets;
-        std::vector<HypernodeWeight> hn_weights;
-        std::vector<Hyperedge> tmp_hyperedges;
-        CompressedIncidenceArray tmp_incidence_array;
-        std::vector<HypernodeID> he_sizes;
-        std::vector<bool> valid_hyperedges;
+        ds::Array<size_t> mapping;
+        ds::Array<Hypernode> tmp_hypernodes;
+        // For incident nets/pins during contraction we need uncompressed ID buffers
+        ds::Array<HyperedgeID> tmp_incident_nets;
+        ds::Array<parallel::IntegralAtomicWrapper<size_t>> tmp_num_incident_nets;
+        ds::Array<parallel::IntegralAtomicWrapper<HypernodeWeight>> hn_weights;
+        ds::Array<Hyperedge> tmp_hyperedges;
+        ds::Array<HypernodeID> tmp_incidence_array;
+        ds::Array<size_t> he_sizes;
+        ds::Array<size_t> valid_hyperedges;
     };
 
 public:
