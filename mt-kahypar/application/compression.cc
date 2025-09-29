@@ -206,21 +206,34 @@ static inline unsigned sampler_interval_ms_from_env() {
     return interval;
 }
 
-static inline bool csv_has_header(const std::string& csv_path) {
-    std::ifstream in(csv_path);
-    if (!in) return false;
-    std::string first;
-    if (!std::getline(in, first)) return false;
-    return first.rfind("FileName,NodeCount,HyperedgeCount,IOTimeMS,PartitionTimeMS,", 0) == 0;
-}
-
+// Write a fresh header (truncate file). Call this once per full benchmark run (parent process).
 void write_csv_header(const std::string& csv_path) {
-    if (csv_has_header(csv_path)) return; // Keep existing
-    std::ofstream outfile(csv_path, std::ios::app);
+    std::ofstream outfile(csv_path, std::ios::trunc);
     outfile << "FileName,NodeCount,HyperedgeCount,IOTimeMS,PartitionTimeMS,"
                "IOPeakRSSKB,PartitionPeakRSSKB,IOAbsPeakRSSKB,PartitionAbsPeakRSSKB,"
                "MemoryUsage,PartitionQuality,Compressed"
             << std::endl;
+}
+
+// Ensure header exists without truncation (used by per-file child runs).
+static inline void ensure_csv_header(const std::string& csv_path) {
+    std::ifstream in(csv_path);
+    bool need_header = true;
+    if (in) {
+        std::string first;
+        if (std::getline(in, first)) {
+            if (first.rfind("FileName,NodeCount,HyperedgeCount,IOTimeMS,PartitionTimeMS,", 0) == 0) {
+                need_header = false;
+            }
+        }
+    }
+    if (need_header) {
+        std::ofstream outfile(csv_path, std::ios::app);
+        outfile << "FileName,NodeCount,HyperedgeCount,IOTimeMS,PartitionTimeMS,"
+                   "IOPeakRSSKB,PartitionPeakRSSKB,IOAbsPeakRSSKB,PartitionAbsPeakRSSKB,"
+                   "MemoryUsage,PartitionQuality,Compressed"
+                << std::endl;
+    }
 }
 
 void append_csv_line(const std::string& csv_path, const std::string& filename,
@@ -470,15 +483,17 @@ int main(int argc, char* argv[]) {
 
     const std::string OUTPUT_PATH = "./__out/benchmark.csv";
 
-    write_csv_header(OUTPUT_PATH);
-
     // Child mode: run a single file (used for isolation via environment variables)
     if (const char* single = std::getenv("MTK_SINGLE_FILE")) {
         const char* c = std::getenv("MTK_COMPRESSED");
         const bool compressed = (c && *c == '1');
+        ensure_csv_header(OUTPUT_PATH);
         partition_graph(single, base, OUTPUT_PATH, compressed);
         return 0;
     }
+
+    // Parent process: reset CSV for a fresh run
+    write_csv_header(OUTPUT_PATH);
 
     const std::string directory = "./_graphs/benchmark_set_d";
 
