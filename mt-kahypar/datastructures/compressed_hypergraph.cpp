@@ -223,12 +223,10 @@ namespace mt_kahypar::ds {
     hypergraph._hyperedge_enabled.assign(hypergraph._num_hyperedges, 1);
     hypergraph._compressed_incidence_array.clear();
     hypergraph._compressed_incident_nets.clear();
-    // Initialize lazy weights
-    hypergraph._hypernode_weights.assign(num_coarse_nodes, 1);
-    hypergraph._hyperedge_weights.assign(hypergraph._num_hyperedges, 1);
 
     // Set node weights; prepare incident nets buckets
     std::vector<std::vector<HyperedgeID>> incident_nets(num_coarse_nodes);
+    hypergraph._hypernode_weights.ensure_initialized(num_coarse_nodes);
     for (HypernodeID u = 0; u < num_coarse_nodes; ++u) {
       hypergraph._hypernode_weights[u] = coarse_node_weight[u];
       // firstEntry/compressed sizes set later
@@ -241,6 +239,7 @@ namespace mt_kahypar::ds {
       hypergraph._hyperedge_offsets[he] = pins_bytes_offset;
       // header varint for pins size
       encode_varint(static_cast<uint64_t>(pins.size()), hypergraph._compressed_incidence_array);
+      if (hypergraph._hyperedge_weights.empty()) hypergraph._hyperedge_weights.ensure_initialized(hypergraph._num_hyperedges);
       hypergraph._hyperedge_weights[he] = coarse_edge_weight[he];
 
       // Varint gap-encode pins
@@ -283,8 +282,8 @@ namespace mt_kahypar::ds {
         prev_e = e;
       }
 
-      hypergraph._total_degree += static_cast<HypernodeID>(list.size());
-      tw += hypergraph._hypernode_weights[u];
+  hypergraph._total_degree += static_cast<HypernodeID>(list.size());
+  tw += hypergraph._hypernode_weights[u];
     }
     hypergraph._total_weight = tw;
 
@@ -348,7 +347,7 @@ namespace mt_kahypar::ds {
     }, [&] {
       hypergraph._community_ids = _community_ids;
     }, [&] {
-      hypergraph._hypernode_weights = _hypernode_weights;
+      hypergraph._hypernode_weights = _hypernode_weights; // vector and map copy
     }, [&] {
       hypergraph._hyperedge_weights = _hyperedge_weights;
     }, [&] {
@@ -386,9 +385,9 @@ namespace mt_kahypar::ds {
     memcpy(hypergraph._compressed_incidence_array.data(), _compressed_incidence_array.data(),
            sizeof(uint8_t) * _compressed_incidence_array.size());
 
-    hypergraph._community_ids = _community_ids;
-    hypergraph._hypernode_weights = _hypernode_weights;
-    hypergraph._hyperedge_weights = _hyperedge_weights;
+  hypergraph._community_ids = _community_ids;
+  hypergraph._hypernode_weights = _hypernode_weights;
+  hypergraph._hyperedge_weights = _hyperedge_weights;
     hypergraph.addFixedVertexSupport(_fixed_vertices.copy());
 
     return hypergraph;
@@ -403,9 +402,29 @@ namespace mt_kahypar::ds {
     parent->addChild("Hyperedge Enabled (bits)", (_hyperedge_enabled.capacity() + 7) / 8);
     parent->addChild("Incidence Array", sizeof(uint8_t) * _compressed_incidence_array.size());
     parent->addChild("Communities", sizeof(PartitionID) * _community_ids.capacity());
+    parent->addChild("Hypernode Weights (two-level)", _hypernode_weights.approx_bytes());
+    parent->addChild("Hyperedge Weights (two-level)", _hyperedge_weights.approx_bytes());
     if ( hasFixedVertices() ) {
       parent->addChild("Fixed Vertex Support", _fixed_vertices.size_in_bytes());
     }
+  }
+
+  size_t CompressedHypergraph::memoryConsumptionKB() const {
+    size_t total = 0;
+    total += sizeof(size_t) * _hypernode_offsets.capacity();
+    // BitVector packs bits; approximate bytes as ceil(capacity_in_bits/8)
+    total += ((_hypernode_enabled.capacity() + 7) / 8);
+    total += sizeof(uint8_t) * _compressed_incident_nets.size();
+    total += sizeof(size_t) * _hyperedge_offsets.capacity();
+    total += ((_hyperedge_enabled.capacity() + 7) / 8);
+    total += sizeof(uint8_t) * _compressed_incidence_array.size();
+    total += _hypernode_weights.approx_bytes();
+    total += _hyperedge_weights.approx_bytes();
+    total += sizeof(PartitionID) * _community_ids.capacity();
+    if (_fixed_vertices.hasFixedVertices()) {
+        total += _fixed_vertices.size_in_bytes();
+    }
+    return total / 1024;
   }
 
   // ! Computes the total node weight of the hypergraph

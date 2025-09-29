@@ -178,7 +178,10 @@ CompressedHypergraph CompressedHypergraphFactory::stream(const std::string& file
   hg._num_hyperedges = current_he_id;
   hg._num_removed_hyperedges = removed_single_pin;
   if (has_edge_weights) {
-    hg._hyperedge_weights = std::move(tmp_edge_weights);
+    hg._hyperedge_weights.ensure_initialized(hg._num_hyperedges);
+    for (HyperedgeID he = 0; he < static_cast<HyperedgeID>(tmp_edge_weights.size()); ++he) {
+      hg._hyperedge_weights[he] = tmp_edge_weights[he];
+    }
   }
 
   // Read node weights if present (V weights as raw numbers possibly across lines)
@@ -220,10 +223,10 @@ CompressedHypergraph CompressedHypergraphFactory::stream(const std::string& file
     arr.clear();
 
     if (!has_node_weights) continue;
-    HypernodeWeight w = node_weights[id];
-    if (hg._hypernode_weights.empty()) hg._hypernode_weights.assign(V, 1);
-    hg._hypernode_weights[id] = w;
-    hg._total_weight += w;
+  HypernodeWeight w = node_weights[id];
+  if (hg._hypernode_weights.empty()) hg._hypernode_weights.ensure_initialized(V);
+  hg._hypernode_weights[id] = w;
+  hg._total_weight += w;
   }
   if (!has_node_weights) hg._total_weight = static_cast<HypernodeWeight>(V);
 
@@ -289,7 +292,7 @@ CompressedHypergraph CompressedHypergraphFactory::construct(
     // header varint for pins size
     push_varint(hg._compressed_incidence_array, pins.size());
     if (hyperedge_weight) {
-      if (hg._hyperedge_weights.empty()) hg._hyperedge_weights.assign(H, 1);
+      if (hg._hyperedge_weights.empty()) hg._hyperedge_weights.ensure_initialized(H);
       hg._hyperedge_weights[he] = hyperedge_weight[he];
     }
 
@@ -336,7 +339,7 @@ CompressedHypergraph CompressedHypergraphFactory::construct(
 
   // set lazy node weights if provided
   if (hypernode_weight) {
-    hg._hypernode_weights.assign(V, 1);
+    hg._hypernode_weights.ensure_initialized(V);
     for (HypernodeID u = 0; u < V; ++u) {
       hg._hypernode_weights[u] = hypernode_weight[u];
       hg._total_weight += hypernode_weight[u];

@@ -33,11 +33,13 @@
 #include <algorithm>
 #include <cstring>
 #include <unordered_map>
+#include <limits>
 #include "include/mtkahypartypes.h"
 #include "mt-kahypar/macros.h"
 #include "mt-kahypar/datastructures/array.h"
 #include "mt-kahypar/datastructures/hypergraph_common.h"
 #include "mt-kahypar/datastructures/fixed_vertex_support.h"
+#include "mt-kahypar/datastructures/two_level_vector.h"
 #include "mt-kahypar/partition/context_enum_classes.h"
 #include "mt-kahypar/utils/memory_tree.h"
 #include "mt-kahypar/utils/range.h"
@@ -117,7 +119,10 @@ class CompressedHypergraph {
     static_assert(std::is_unsigned<HypernodeID>::value, "Hypernode ID must be unsigned");
     static_assert(std::is_unsigned<HyperedgeID>::value, "Hyperedge ID must be unsigned");
     
-    using UncontractionFunction = std::function<void(const HypernodeID, const HypernodeID, const HyperedgeID)>;
+        using UncontractionFunction = std::function<void(const HypernodeID, const HypernodeID, const HyperedgeID)>;
+
+    // Used for the two-level vectors below
+    using WeightBaseT = uint16_t;
 
 #define NOOP_BATCH_FUNC [] (const HypernodeID, const HypernodeID, const HyperedgeID) { }
 
@@ -162,22 +167,15 @@ class CompressedHypergraph {
         size_t pos = begin;
         return static_cast<HyperedgeID>(decode_varint_bounded(_hg->_compressed_incident_nets, pos, nextNodePos()));
     }
-    HypernodeWeight weight() const {
-        if (_hg->_hypernode_weights.empty()) return 1;
-        return _hg->_hypernode_weights[_id];
-    }
-    void setWeight(HypernodeWeight w) const {
-        if (w == 1) {
-            if (_hg->_hypernode_weights.empty()) return;
-            _hg->_hypernode_weights[_id] = 1;
-            return;
+        HypernodeWeight weight() const {
+            // Two-level lazy vector: default is 1 when not initialized
+            return _hg->_hypernode_weights[_id];
         }
-        if (_hg->_hypernode_weights.empty()) {
-            auto& vec = _hg->_hypernode_weights;
-            vec.assign(_hg->_num_hypernodes, 1);
+        void setWeight(HypernodeWeight w) const {
+            if (w == 1 && _hg->_hypernode_weights.empty()) return; // keep lazy default
+            if (_hg->_hypernode_weights.empty()) _hg->_hypernode_weights.ensure_initialized(_hg->_num_hypernodes);
+            _hg->_hypernode_weights[_id] = w;
         }
-        _hg->_hypernode_weights[_id] = w;
-    }
         HypernodeID id() const { return _id; }
 
     private:
@@ -197,52 +195,42 @@ class CompressedHypergraph {
         Hyperedge() : _hg(nullptr), _id(0) {}
         Hyperedge(CompressedHypergraph* hg, HyperedgeID id) : _hg(hg), _id(id) {}
 
-    bool isDisabled() const { return !_hg || !_hg->_hyperedge_enabled[_id]; }
-    void enable() const { ASSERT(_hg); _hg->_hyperedge_enabled[_id] = true; }
-    void disable() const { ASSERT(_hg); _hg->_hyperedge_enabled[_id] = false; }
+        bool isDisabled() const { return !_hg || !_hg->_hyperedge_enabled[_id]; }
+        void enable() const { ASSERT(_hg); _hg->_hyperedge_enabled[_id] = true; }
+        void disable() const { ASSERT(_hg); _hg->_hyperedge_enabled[_id] = false; }
 
-    // Start of pin list (after size header)
-    size_t firstEntry() const {
-        const size_t begin = _hg->_hyperedge_offsets[_id];
-        size_t pos = begin;
-        (void)decode_varint_bounded(_hg->_compressed_incidence_array, pos, nextEdgePos());
-        return pos;
-    }
-    void setFirstEntry(const size_t begin) const { ASSERT(!isDisabled()); _hg->_hyperedge_offsets[_id] = begin; }
+        // Start of pin list (after size header)
+        size_t firstEntry() const {
+            const size_t begin = _hg->_hyperedge_offsets[_id];
+            size_t pos = begin;
+            (void)decode_varint_bounded(_hg->_compressed_incidence_array, pos, nextEdgePos());
+            return pos;
+        }
+        void setFirstEntry(const size_t begin) const { ASSERT(!isDisabled()); _hg->_hyperedge_offsets[_id] = begin; }
 
-    // End position (one past last data byte), trim a single trailing 0x00 padding byte if present
-    size_t firstInvalidEntry() const {
-        const size_t start = firstEntry();
-        size_t end = nextEdgePos();
-        while (
-            end > (start + 1)
-            && _hg->_compressed_incidence_array[end - 1] == 0x00u
-            && (_hg->_compressed_incidence_array[end - 2] & 0x80) == 0
-        ) end--;
-        if (end == start + 1 && this->size() == 0) return start; // edge case: only padding bytes
-        return end;
-    }
-    HypernodeID size() const {
-        const size_t begin = _hg->_hyperedge_offsets[_id];
-        size_t pos = begin;
-        return static_cast<HypernodeID>(decode_varint_bounded(_hg->_compressed_incidence_array, pos, nextEdgePos()));
-    }
-    HyperedgeWeight weight() const {
-        if (_hg->_hyperedge_weights.empty()) return 1;
-        return _hg->_hyperedge_weights[_id];
-    }
-    void setWeight(HyperedgeWeight w) const {
-        if (w == 1) {
-            if (_hg->_hyperedge_weights.empty()) return;
-            _hg->_hyperedge_weights[_id] = 1;
-            return;
+        // End position (one past last data byte), trim a single trailing 0x00 padding byte if present
+        size_t firstInvalidEntry() const {
+            const size_t start = firstEntry();
+            size_t end = nextEdgePos();
+            while (
+                end > (start + 1)
+                && _hg->_compressed_incidence_array[end - 1] == 0x00u
+                && (_hg->_compressed_incidence_array[end - 2] & 0x80) == 0
+            ) end--;
+            if (end == start + 1 && this->size() == 0) return start; // edge case: only padding bytes
+            return end;
         }
-        if (_hg->_hyperedge_weights.empty()) {
-            auto& vec = _hg->_hyperedge_weights;
-            vec.assign(_hg->_num_hyperedges, 1);
+        HypernodeID size() const {
+            const size_t begin = _hg->_hyperedge_offsets[_id];
+            size_t pos = begin;
+            return static_cast<HypernodeID>(decode_varint_bounded(_hg->_compressed_incidence_array, pos, nextEdgePos()));
         }
-        _hg->_hyperedge_weights[_id] = w;
-    }
+        HyperedgeWeight weight() const { return _hg->_hyperedge_weights[_id]; }
+        void setWeight(HyperedgeWeight w) const {
+            if (w == 1 && _hg->_hyperedge_weights.empty()) return;
+            if (_hg->_hyperedge_weights.empty()) _hg->_hyperedge_weights.ensure_initialized(_hg->_num_hyperedges);
+            _hg->_hyperedge_weights[_id] = w;
+        }
         HyperedgeID id() const { return _id; }
 
         bool operator==(const Hyperedge& other) const { return _hg == other._hg && _id == other._id; }
@@ -756,19 +744,17 @@ public:
 
     // ####################### Hypernode Information #######################
 
-    HypernodeWeight nodeWeight(const HypernodeID u) const {
-        if (_hypernode_weights.empty()) return 1;
-        return _hypernode_weights[u];
-    }
+    HypernodeWeight nodeWeight(const HypernodeID u) const { return _hypernode_weights[u]; }
 
     void setNodeWeight(const HypernodeID u, const HypernodeWeight weight) {
         ASSERT(nodeIsEnabled(u), "Hypernode" << u << "is disabled");
-        if (weight == 1) {
-            if (!_hypernode_weights.empty()) { _hypernode_weights[u] = 1; }
-        } else {
-            if (_hypernode_weights.empty()) _hypernode_weights.assign(_num_hypernodes, 1);
-            _hypernode_weights[u] = weight;
-        }
+        // Read old value first (works with lazy default = 1)
+    const HypernodeWeight old_w = _hypernode_weights[u];
+        if (_hypernode_weights.empty() && weight == 1) return; // keep lazy default
+        if (_hypernode_weights.empty()) _hypernode_weights.ensure_initialized(_num_hypernodes);
+        _hypernode_weights[u] = weight;
+        // Maintain total weight incrementally
+        _total_weight += (weight - old_w);
     }
 
     HyperedgeID nodeDegree(const HypernodeID u) const {
@@ -801,18 +787,14 @@ public:
 
     HypernodeWeight edgeWeight(const HyperedgeID e) const {
         ASSERT(edgeIsEnabled(e), "Hyperedge" << e << "is disabled");
-        if (_hyperedge_weights.empty()) return 1;
-        return _hyperedge_weights[e];
+    return _hyperedge_weights[e];
     }
 
     void setEdgeWeight(const HyperedgeID e, const HyperedgeWeight weight) {
         ASSERT(edgeIsEnabled(e), "Hyperedge" << e << "is disabled");
-        if (weight == 1) {
-            if (!_hyperedge_weights.empty()) { _hyperedge_weights[e] = 1; }
-        } else {
-            if (_hyperedge_weights.empty()) _hyperedge_weights.assign(_num_hyperedges, 1);
-            _hyperedge_weights[e] = weight;
-        }
+    if (_hyperedge_weights.empty() && weight == 1) return;
+    if (_hyperedge_weights.empty()) _hyperedge_weights.ensure_initialized(_num_hyperedges);
+    _hyperedge_weights[e] = weight;
     }
 
     HypernodeID edgeSize(const HyperedgeID e) const {
@@ -1194,8 +1176,10 @@ public:
         _hyperedge_offsets.shrink_to_fit();
         _hyperedge_enabled.clear();
         _hyperedge_enabled.shrink_to_fit();
-        _compressed_incidence_array.clear();
-        _compressed_incidence_array.shrink_to_fit();
+    _compressed_incidence_array.clear();
+    _compressed_incidence_array.shrink_to_fit();
+    _hypernode_weights.clear();
+    _hyperedge_weights.clear();
         _community_ids.clear();
         _community_ids.shrink_to_fit();
         _fixed_vertices = FixedVertexSupport<CompressedHypergraph>();
@@ -1219,24 +1203,7 @@ public:
     }
 
     void memoryConsumption(utils::MemoryTreeNode* parent) const;
-
-    size_t memoryConsumptionKB() const {
-        size_t total = 0;
-        total += sizeof(size_t) * _hypernode_offsets.capacity();
-        // BitVector packs bits; approximate bytes as ceil(capacity_in_bits/8)
-        total += ((_hypernode_enabled.capacity() + 7) / 8);
-        total += sizeof(uint8_t) * _compressed_incident_nets.size();
-        total += sizeof(size_t) * _hyperedge_offsets.capacity();
-        total += ((_hyperedge_enabled.capacity() + 7) / 8);
-        total += sizeof(uint8_t) * _compressed_incidence_array.size();
-        total += sizeof(HypernodeWeight) * _hypernode_weights.capacity();
-        total += sizeof(HyperedgeWeight) * _hyperedge_weights.capacity();
-        total += sizeof(PartitionID) * _community_ids.capacity();
-        if (_fixed_vertices.hasFixedVertices()) {
-            total += _fixed_vertices.size_in_bytes();
-        }
-        return total / 1024;
-    }
+    size_t memoryConsumptionKB() const;
 
     bool verifyIncidenceArrayAndIncidentNets() {
         throw UnsupportedOperationException(
@@ -1337,9 +1304,9 @@ private:
     std::vector<size_t> _hyperedge_offsets;   // CSR offsets into _compressed_incidence_array
     BitVector _hyperedge_enabled;             // true = enabled, false = disabled
     CompressedIncidenceArray _compressed_incidence_array;  // Compressed pins storage
-    // Lazy weight storage (default 1 when empty)
-    std::vector<HypernodeWeight> _hypernode_weights;
-    std::vector<HyperedgeWeight> _hyperedge_weights;
+    // Lazy, two-level weight storage (default 1 when empty)
+    mt_kahypar::ds::TwoLevelVector<WeightBaseT, HypernodeWeight> _hypernode_weights;
+    mt_kahypar::ds::TwoLevelVector<WeightBaseT, HyperedgeWeight> _hyperedge_weights;
 
     // Communities and fixed vertices (uncompressed as requested)
     ds::Clustering _community_ids;

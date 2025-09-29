@@ -371,3 +371,97 @@ TEST(CompressedHypergraphFactoryConstruct, MatchesStaticFactoryConstruct) {
 
   assert_equality(s, c);
 }
+
+// --- Two-level weights specific tests ---
+
+TEST(CompressedHypergraphTwoLevelWeights, DefaultIsOneAndLazy) {
+  // Build edges and construct compressed hypergraph WITHOUT explicit weights.
+  parallel::scalable_vector<parallel::scalable_vector<HypernodeID>> edges;
+  HypernodeID num_nodes;
+  build_large_edges(edges, num_nodes);
+  const HyperedgeID num_edges = edges.size();
+
+  // Normalize pins per edge to match loader semantics (sorted unique)
+  for (auto& e : edges) { std::sort(e.begin(), e.end()); e.erase(std::unique(e.begin(), e.end()), e.end()); }
+
+  ds::CompressedHypergraph c = ds::CompressedHypergraphFactory::construct(
+      num_nodes, num_edges, edges, /*edge_weights=*/nullptr, /*node_weights=*/nullptr, /*stable=*/false);
+
+  // All node and edge weights should read as 1; total weight equals number of nodes
+  EXPECT_EQ(static_cast<HypernodeWeight>(num_nodes), c.totalWeight()) << "total node weight should be V when no weights provided";
+  for (HypernodeID u = 0; u < num_nodes; ++u) {
+    EXPECT_EQ(1, c.nodeWeight(u)) << "default node weight must be 1 at u=" << u;
+  }
+  for (HyperedgeID e = 0; e < num_edges; ++e) {
+    EXPECT_EQ(1, c.edgeWeight(e)) << "default edge weight must be 1 at e=" << e;
+  }
+}
+
+TEST(CompressedHypergraphTwoLevelWeights, SupportsLargeAndSparseValuesAndContract) {
+  // Build edges and assign mostly-1 weights with a few large values to exercise overflow path.
+  parallel::scalable_vector<parallel::scalable_vector<HypernodeID>> edges;
+  HypernodeID num_nodes;
+  build_large_edges(edges, num_nodes);
+  const HyperedgeID num_edges = edges.size();
+
+  // Normalize pins per edge to match loader semantics (sorted unique)
+  for (auto& e : edges) { std::sort(e.begin(), e.end()); e.erase(std::unique(e.begin(), e.end()), e.end()); }
+
+  std::vector<HyperedgeWeight> he_w(num_edges, 1);
+  std::vector<HypernodeWeight> hn_w(num_nodes, 1);
+  // Large/sparse values
+  he_w[1] = 300;        // > 255 to exceed uint8_t base
+  he_w[3] = 10000;      // much larger
+  hn_w[0] = 500;        // > 255
+  hn_w[2600] = 70000;   // large value
+
+  ds::StaticHypergraph s = ds::StaticHypergraphFactory::construct(num_nodes, num_edges, edges,
+                                                                  he_w.data(), hn_w.data(), false);
+  ds::CompressedHypergraph c = ds::CompressedHypergraphFactory::construct(num_nodes, num_edges, edges,
+                                                                          he_w.data(), hn_w.data(), false);
+
+  // The two representations must agree on weights and structure
+  assert_equality(s, c);
+
+  // Also validate that contraction preserves weight semantics identically in both reps
+  parallel::scalable_vector<HypernodeID> communities(num_nodes);
+  for (HypernodeID u = 0; u < num_nodes; ++u) communities[u] = static_cast<HypernodeID>(u / 700);
+  auto s_coarse = s.contract(communities, /*deterministic=*/false);
+  auto c_coarse = c.contract(communities, /*deterministic=*/false);
+  assert_equality(s_coarse, c_coarse);
+}
+
+TEST(CompressedHypergraphTwoLevelWeights, SettersUpdateValuesCorrectly) {
+  // Start with no explicit weights, then set a few nodes/edges to large values
+  parallel::scalable_vector<parallel::scalable_vector<HypernodeID>> edges;
+  HypernodeID num_nodes;
+  build_large_edges(edges, num_nodes);
+  const HyperedgeID num_edges = edges.size();
+  for (auto& e : edges) { std::sort(e.begin(), e.end()); e.erase(std::unique(e.begin(), e.end()), e.end()); }
+
+  ds::CompressedHypergraph c = ds::CompressedHypergraphFactory::construct(
+      num_nodes, num_edges, edges, /*edge_weights=*/nullptr, /*node_weights=*/nullptr, /*stable=*/false);
+
+  // Verify defaults
+  EXPECT_EQ(static_cast<HypernodeWeight>(num_nodes), c.totalWeight());
+  EXPECT_EQ(1, c.nodeWeight(0));
+  EXPECT_EQ(1, c.edgeWeight(0));
+
+  // Update a few weights, including very large values
+  c.setNodeWeight(0, static_cast<HypernodeWeight>(500));
+  c.setNodeWeight(2600, static_cast<HypernodeWeight>(70000));
+  c.setEdgeWeight(1, static_cast<HyperedgeWeight>(300));
+  c.setEdgeWeight(3, static_cast<HyperedgeWeight>(10000));
+
+  // Read back
+  EXPECT_EQ(500, c.nodeWeight(0));
+  EXPECT_EQ(70000, c.nodeWeight(2600));
+  EXPECT_EQ(300, c.edgeWeight(1));
+  EXPECT_EQ(10000, c.edgeWeight(3));
+
+  // Total node weight should reflect updates: started as num_nodes (all ones), then +499 and +69999
+  const HypernodeWeight expected_total = static_cast<HypernodeWeight>(num_nodes)
+                                       + static_cast<HypernodeWeight>(499)
+                                       + static_cast<HypernodeWeight>(69999);
+  EXPECT_EQ(expected_total, c.totalWeight());
+}
