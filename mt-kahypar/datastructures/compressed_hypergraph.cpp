@@ -41,6 +41,23 @@
 
 namespace mt_kahypar::ds {
 
+  // Raw varint helpers for fixed-position encoding to a byte buffer
+  static inline size_t varint_size_u64(uint64_t v) {
+    size_t n = 1;
+    while (v >= 0x80) { v >>= 7; ++n; }
+    return n;
+  }
+
+  static inline size_t encode_varint_to_ptr(uint64_t v, uint8_t* out) {
+    size_t i = 0;
+    while (v >= 0x80) {
+      out[i++] = static_cast<uint8_t>((v & 0x7F) | 0x80);
+      v >>= 7;
+    }
+    out[i++] = static_cast<uint8_t>(v & 0x7F);
+    return i;
+  }
+
 
   /*!
   * This struct is used during multilevel coarsening to efficiently
@@ -85,7 +102,7 @@ namespace mt_kahypar::ds {
       }
     }
 
-    std::vector<HypernodeID> label_to_coarse(_num_hypernodes, kInvalidHypernode);
+  std::vector<HypernodeID> label_to_coarse(_num_hypernodes, kInvalidHypernode);
     HypernodeID next_coarse = 0;
     for (HypernodeID lab = 0; lab < _num_hypernodes; ++lab) {
       if (present[lab]) label_to_coarse[lab] = next_coarse++;
@@ -99,6 +116,12 @@ namespace mt_kahypar::ds {
       }
     }
 
+    // Release temporary label maps early
+    present.clear();
+    present.shrink_to_fit();
+    label_to_coarse.clear();
+    label_to_coarse.shrink_to_fit();
+
     // Aggregate coarse node weights
     std::vector<HypernodeWeight> coarse_node_weight(num_coarse_nodes, 0);
     for (HypernodeID hn = 0; hn < _num_hypernodes; ++hn) {
@@ -109,40 +132,19 @@ namespace mt_kahypar::ds {
     }
 
     // #################### STAGE 2 ####################
-    // Remap hyperedges to coarse graph, remove single-pin nets, and prepare for parallel merging
-    struct VectorHash {
-      size_t operator()(const std::vector<HypernodeID>& v) const noexcept {
-        // 64-bit mix (similar to boost::hash_combine)
-        size_t h = 1469598103934665603ull;
-        for (HypernodeID x : v) {
-          h ^= static_cast<size_t>(x) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-        }
-        return h;
-      }
-    };
+    // Deduplicate coarse edges without storing per-edge byte slices.
+    // We collect candidate edges as IDs with lightweight metadata, sort by (hash, size),
+    // and tie-break with on-the-fly lexicographic comparison of coarse pins.
 
-    std::unordered_map<std::vector<HypernodeID>, HyperedgeID, VectorHash> parallel_map;
-    parallel_map.reserve(static_cast<size_t>(_num_hyperedges));
-
-    std::vector<std::vector<HypernodeID>> coarse_edges;       // pins per coarse edge (sorted, unique)
-    coarse_edges.reserve(static_cast<size_t>(_num_hyperedges));
-    std::vector<HyperedgeWeight> coarse_edge_weight;          // merged weights
-    coarse_edge_weight.reserve(static_cast<size_t>(_num_hyperedges));
-
-    // Decode every enabled edge, map to coarse, sort+unique, drop single-pin,
-    // and merge parallel hyperedges by identical pin sets.
-    for (HyperedgeID he = 0; he < _num_hyperedges; ++he) {
-      if (!edgeIsEnabled(he)) continue;
-
+    auto build_coarse_pins = [&](HyperedgeID he, std::vector<HypernodeID>& out) {
       auto HE = hyperedge(he);
       const size_t begin = HE.firstEntry();
       const size_t end   = HE.firstInvalidEntry();
       size_t pos = begin;
       HypernodeID prev = 0;
-
-      std::vector<HypernodeID> pins;
       const size_t esize = static_cast<size_t>(HE.size());
-      pins.reserve(esize);
+      out.clear();
+      out.reserve(esize);
       size_t emitted = 0;
       while (pos < end && emitted < esize) {
         const uint64_t gap = decode_varint_bounded(_compressed_incidence_array, pos, end);
@@ -151,65 +153,103 @@ namespace mt_kahypar::ds {
         prev = v;
         ++emitted;
         const HypernodeID ch = map_to_coarse(v);
-        if (ch != kInvalidHypernode) {
-          pins.push_back(ch);
-        }
+        if (ch != kInvalidHypernode) out.push_back(ch);
       }
-      if (pins.empty()) continue;
-
-      std::sort(pins.begin(), pins.end());
-      pins.erase(std::unique(pins.begin(), pins.end()), pins.end());
-
-      if (pins.size() <= 1) {
-        // becomes single-pin in coarse graph => drop
-        continue;
+      if (!out.empty()) {
+        std::sort(out.begin(), out.end());
+        out.erase(std::unique(out.begin(), out.end()), out.end());
       }
+    };
 
-      auto it = parallel_map.find(pins);
-      if (it == parallel_map.end()) {
-        HyperedgeID new_id = static_cast<HyperedgeID>(coarse_edges.size());
-        parallel_map.emplace(pins, new_id);
-        coarse_edge_weight.push_back(edgeWeight(he));
-        coarse_edges.emplace_back(std::move(pins));
-      } else {
-        // parallel net: accumulate weights
-        coarse_edge_weight[it->second] += edgeWeight(he);
+    auto hash_pins = [&](const std::vector<HypernodeID>& v) -> uint64_t {
+      // 64-bit FNV-1a style mix
+      uint64_t h = 1469598103934665603ull;
+      for (HypernodeID x : v) {
+        h ^= static_cast<uint64_t>(x) + 0x9e3779b97f4a7c15ULL;
+        h *= 1099511628211ull;
       }
+      return h;
+    };
+
+    std::vector<HyperedgeID> cand; cand.reserve(static_cast<size_t>(_num_hyperedges));
+    std::vector<uint64_t> chash; chash.reserve(static_cast<size_t>(_num_hyperedges));
+    std::vector<uint32_t> csize; csize.reserve(static_cast<size_t>(_num_hyperedges));
+
+    std::vector<HypernodeID> tmp; tmp.reserve(32);
+    for (HyperedgeID he = 0; he < _num_hyperedges; ++he) {
+      if (!edgeIsEnabled(he)) continue;
+      build_coarse_pins(he, tmp);
+      if (tmp.size() <= 1) continue;
+      cand.push_back(he);
+      chash.push_back(hash_pins(tmp));
+      csize.push_back(static_cast<uint32_t>(tmp.size()));
     }
 
-    // Determinism: optional reordering by pins to stabilize IDs
-    // We keep insertion order for performance; if requested, sort by pins lexicographically
-    if (deterministic) {
-      // Build permutation by comparing pin vectors
-      std::vector<HyperedgeID> perm(coarse_edges.size());
-      std::iota(perm.begin(), perm.end(), 0);
-      std::stable_sort(perm.begin(), perm.end(), [&](HyperedgeID a, HyperedgeID b) {
-        const auto& A = coarse_edges[a];
-        const auto& B = coarse_edges[b];
-        return std::lexicographical_compare(A.begin(), A.end(), B.begin(), B.end());
-      });
-      // Apply permutation
-      std::vector<std::vector<HypernodeID>> edges_sorted;
-      edges_sorted.reserve(coarse_edges.size());
-      std::vector<HyperedgeWeight> weights_sorted;
-      weights_sorted.reserve(coarse_edges.size());
-      std::vector<HyperedgeID> old_to_new(coarse_edges.size());
-      for (HyperedgeID new_id = 0; new_id < perm.size(); ++new_id) {
-        edges_sorted.emplace_back(std::move(coarse_edges[perm[new_id]]));
-        weights_sorted.emplace_back(coarse_edge_weight[perm[new_id]]);
-        old_to_new[perm[new_id]] = new_id;
+    std::vector<size_t> perm(cand.size());
+    std::iota(perm.begin(), perm.end(), 0);
+    auto cmp_coarse = [&](size_t ia, size_t ib) {
+      const uint64_t ha = chash[ia], hb = chash[ib];
+      if (ha != hb) return ha < hb;
+      if (csize[ia] != csize[ib]) return csize[ia] < csize[ib];
+      const HyperedgeID a = cand[ia];
+      const HyperedgeID b = cand[ib];
+      std::vector<HypernodeID> va, vb;
+      build_coarse_pins(a, va);
+      build_coarse_pins(b, vb);
+      // sizes equal here
+      return std::lexicographical_compare(va.begin(), va.end(), vb.begin(), vb.end());
+    };
+    std::stable_sort(perm.begin(), perm.end(), cmp_coarse);
+
+    // Build deduplicated representative list, weights, and encoded lengths
+    std::vector<HyperedgeID> uniq_rep; uniq_rep.reserve(perm.size());
+    std::vector<HyperedgeWeight> uniq_weight; uniq_weight.reserve(perm.size());
+    std::vector<uint32_t> uniq_len; uniq_len.reserve(perm.size());
+    std::vector<uint32_t> uniq_pins; uniq_pins.reserve(perm.size());
+
+    size_t i = 0; std::vector<HypernodeID> a, b;
+    while (i < perm.size()) {
+      const size_t idx = perm[i];
+      const HyperedgeID rep = cand[idx];
+      build_coarse_pins(rep, a);
+      const uint32_t pins_cnt = static_cast<uint32_t>(a.size());
+      // Compute encoded length for representative
+      size_t elen = varint_size_u64(pins_cnt);
+      HypernodeID pprev = 0;
+      for (HypernodeID v : a) { elen += varint_size_u64(static_cast<uint64_t>(v - pprev)); pprev = v; }
+      HyperedgeWeight wsum = edgeWeight(rep);
+      size_t j = i + 1;
+      while (j < perm.size()) {
+        const size_t idx2 = perm[j];
+        if (chash[idx2] != chash[idx]) break;
+        if (csize[idx2] != pins_cnt) break;
+        build_coarse_pins(cand[idx2], b);
+        if (b != a) break;
+        wsum += edgeWeight(cand[idx2]);
+        ++j;
       }
-      coarse_edges = std::move(edges_sorted);
-      coarse_edge_weight = std::move(weights_sorted);
-      // No need to update parallel_map further, we won't use it anymore.
-      (void)old_to_new;
+      uniq_rep.push_back(rep);
+      uniq_weight.push_back(wsum);
+      uniq_len.push_back(static_cast<uint32_t>(elen));
+      uniq_pins.push_back(pins_cnt);
+      i = j;
     }
+
+    // We can release candidate metadata now
+    cand.clear(); cand.shrink_to_fit();
+    chash.clear(); chash.shrink_to_fit();
+    csize.clear(); csize.shrink_to_fit();
+    perm.clear(); perm.shrink_to_fit();
+
+    // Pre-compute total bytes for incidence encoding
+    size_t total_inc_bytes = 0;
+    for (uint32_t l : uniq_len) total_inc_bytes += l;
 
     // #################### STAGE 3 ####################
     // Build coarse hypergraph with compressed storage
     CompressedHypergraph hypergraph;
     hypergraph._num_hypernodes = num_coarse_nodes;
-    hypergraph._num_hyperedges = static_cast<HyperedgeID>(coarse_edges.size());
+  hypergraph._num_hyperedges = static_cast<HyperedgeID>(uniq_rep.size());
     hypergraph._num_removed_hyperedges = 0;
     hypergraph._max_edge_size = 0;
     hypergraph._num_pins = 0;
@@ -221,71 +261,126 @@ namespace mt_kahypar::ds {
     hypergraph._hypernode_enabled.assign(num_coarse_nodes, 1);
     hypergraph._hyperedge_offsets.assign(hypergraph._num_hyperedges, 0);
     hypergraph._hyperedge_enabled.assign(hypergraph._num_hyperedges, 1);
-    hypergraph._compressed_incidence_array.clear();
+  hypergraph._compressed_incidence_array.clear();
+  if (total_inc_bytes > 0) hypergraph._compressed_incidence_array.reserve(total_inc_bytes);
     hypergraph._compressed_incident_nets.clear();
 
-    // Set node weights; prepare incident nets buckets
-    std::vector<std::vector<HyperedgeID>> incident_nets(num_coarse_nodes);
+    // Set node weights
     hypergraph._hypernode_weights.ensure_initialized(num_coarse_nodes);
     for (HypernodeID u = 0; u < num_coarse_nodes; ++u) {
       hypergraph._hypernode_weights[u] = coarse_node_weight[u];
       // firstEntry/compressed sizes set later
     }
+    // Coarse node weights no longer needed
+    coarse_node_weight.clear();
+    coarse_node_weight.shrink_to_fit();
 
-    // Encode coarse edges (pins) and collect incident nets
+    // Encode coarse edges (pins) directly into final buffer
     size_t pins_bytes_offset = 0;
+    if (hypergraph._hyperedge_weights.empty()) hypergraph._hyperedge_weights.ensure_initialized(hypergraph._num_hyperedges);
     for (HyperedgeID he = 0; he < hypergraph._num_hyperedges; ++he) {
-      const auto& pins = coarse_edges[he];
       hypergraph._hyperedge_offsets[he] = pins_bytes_offset;
-      // header varint for pins size
+      hypergraph._hyperedge_weights[he] = uniq_weight[he];
+      // Write header and pins for representative
+      std::vector<HypernodeID> pins;
+      build_coarse_pins(uniq_rep[he], pins);
       encode_varint(static_cast<uint64_t>(pins.size()), hypergraph._compressed_incidence_array);
-      if (hypergraph._hyperedge_weights.empty()) hypergraph._hyperedge_weights.ensure_initialized(hypergraph._num_hyperedges);
-      hypergraph._hyperedge_weights[he] = coarse_edge_weight[he];
-
-      // Varint gap-encode pins
-      HypernodeID prev = 0;
+      HypernodeID pprev = 0;
       for (HypernodeID v : pins) {
-        uint64_t gap = static_cast<uint64_t>(v - prev);
-        encode_varint(gap, hypergraph._compressed_incidence_array);
-        prev = v;
+        encode_varint(static_cast<uint64_t>(v - pprev), hypergraph._compressed_incidence_array);
+        pprev = v;
       }
-      const size_t new_end = hypergraph._compressed_incidence_array.size();
-      pins_bytes_offset = new_end;
-
+      pins_bytes_offset += uniq_len[he];
       hypergraph._num_pins += static_cast<HypernodeID>(pins.size());
       if (pins.size() > static_cast<size_t>(hypergraph._max_edge_size)) {
         hypergraph._max_edge_size = static_cast<HypernodeID>(pins.size());
       }
-      // Fill incident nets buckets
-      for (HypernodeID v : pins) {
-        incident_nets[v].push_back(he);
-      }
     }
 
-    // Encode incident nets per node
-    HypernodeWeight tw = 0;
+    // Release uniq metadata vectors we no longer need
+    uniq_rep.clear(); uniq_rep.shrink_to_fit();
+    uniq_weight.clear(); uniq_weight.shrink_to_fit();
+    uniq_len.clear(); uniq_len.shrink_to_fit();
+    uniq_pins.clear(); uniq_pins.shrink_to_fit();
+
+  // From here on, we decode pins from the finalized incidence array using hyperedge offsets.
+
+    // Two-pass, pre-sized encoding of incident nets to minimize peak memory
+    std::vector<HyperedgeID> last_he(num_coarse_nodes, 0);
+    std::vector<size_t> degree(num_coarse_nodes, 0);
+    std::vector<size_t> bytes(num_coarse_nodes, 0);
+
+    // Pass 1: compute degree and total bytes per node (including header)
+    for (HyperedgeID he = 0; he < hypergraph._num_hyperedges; ++he) {
+      const size_t off = hypergraph._hyperedge_offsets[he];
+      const size_t end = (he + 1 < hypergraph._num_hyperedges)
+                           ? hypergraph._hyperedge_offsets[he + 1]
+                           : hypergraph._compressed_incidence_array.size();
+      size_t pos = off;
+      const uint64_t pin_cnt = decode_varint_bounded(hypergraph._compressed_incidence_array, pos, end);
+      HypernodeID prev = 0;
+      for (uint64_t t = 0; t < pin_cnt && pos < end; ++t) {
+        const uint64_t gap = decode_varint_bounded(hypergraph._compressed_incidence_array, pos, end);
+        const HypernodeID v = static_cast<HypernodeID>(prev + gap);
+        prev = v;
+        ++degree[v];
+        const uint64_t legap = static_cast<uint64_t>(he - last_he[v]);
+        bytes[v] += varint_size_u64(legap);
+        last_he[v] = he;
+      }
+    }
+    size_t total_bytes = 0;
     for (HypernodeID u = 0; u < num_coarse_nodes; ++u) {
-      auto& list = incident_nets[u];
-
-      std::sort(list.begin(), list.end());
-      list.erase(std::unique(list.begin(), list.end()), list.end());
-
-      // Start position for this node's incident nets
-      hypergraph._hypernode_offsets[u] = hypergraph._compressed_incident_nets.size();
-      // header varint for degree
-      encode_varint(static_cast<uint64_t>(list.size()), hypergraph._compressed_incident_nets);
-
-      HyperedgeID prev_e = 0;
-      for (HyperedgeID e : list) {
-        uint64_t gap = static_cast<uint64_t>(e - prev_e);
-        encode_varint(gap, hypergraph._compressed_incident_nets);
-        prev_e = e;
-      }
-
-  hypergraph._total_degree += static_cast<HypernodeID>(list.size());
-  tw += hypergraph._hypernode_weights[u];
+      bytes[u] += varint_size_u64(static_cast<uint64_t>(degree[u])); // header for degree
+      hypergraph._hypernode_offsets[u] = total_bytes;
+      total_bytes += bytes[u];
     }
+
+    hypergraph._compressed_incident_nets.clear();
+    hypergraph._compressed_incident_nets.resize(total_bytes);
+
+    // Initialize write pointers and write headers
+    std::vector<uint8_t*> write_ptr(num_coarse_nodes, nullptr);
+    uint8_t* base = hypergraph._compressed_incident_nets.data();
+    for (HypernodeID u = 0; u < num_coarse_nodes; ++u) {
+      uint8_t* ptr = base + hypergraph._hypernode_offsets[u];
+      ptr += encode_varint_to_ptr(static_cast<uint64_t>(degree[u]), ptr);
+      write_ptr[u] = ptr;
+    }
+    std::fill(last_he.begin(), last_he.end(), 0);
+
+    // Pass 2: write gaps in he order
+    hypergraph._total_degree = 0;
+    for (HyperedgeID he = 0; he < hypergraph._num_hyperedges; ++he) {
+      const size_t off = hypergraph._hyperedge_offsets[he];
+      const size_t end = (he + 1 < hypergraph._num_hyperedges)
+                           ? hypergraph._hyperedge_offsets[he + 1]
+                           : hypergraph._compressed_incidence_array.size();
+      size_t pos = off;
+      const uint64_t pin_cnt = decode_varint_bounded(hypergraph._compressed_incidence_array, pos, end);
+      HypernodeID prev = 0;
+      for (uint64_t t = 0; t < pin_cnt && pos < end; ++t) {
+        const uint64_t gapv = decode_varint_bounded(hypergraph._compressed_incidence_array, pos, end);
+        const HypernodeID v = static_cast<HypernodeID>(prev + gapv);
+        prev = v;
+        const uint64_t legap = static_cast<uint64_t>(he - last_he[v]);
+        last_he[v] = he;
+        write_ptr[v] += encode_varint_to_ptr(legap, write_ptr[v]);
+      }
+    }
+    for (HypernodeID u = 0; u < num_coarse_nodes; ++u) {
+      hypergraph._total_degree += static_cast<HypernodeID>(degree[u]);
+    }
+
+  // Total node weight is sum of node weights
+    HypernodeWeight tw = 0;
+    for (HypernodeID u = 0; u < num_coarse_nodes; ++u) tw += hypergraph._hypernode_weights[u];
     hypergraph._total_weight = tw;
+
+  // Release temporary buffers (none left from previous pipeline)
+
+  // Tighten incidence buffer to actual size to reduce residual capacity
+  hypergraph._compressed_incidence_array.shrink_to_fit();
 
     // #################### STAGE 4 ####################
     // Communities: inherit from fine graph (like static version)
