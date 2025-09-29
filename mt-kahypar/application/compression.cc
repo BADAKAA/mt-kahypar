@@ -9,6 +9,13 @@ namespace fs = std::filesystem;
 
 #include <iostream>
 #include <algorithm>
+#include <cstdlib>
+#include <atomic>
+#include <optional>
+#include <limits>
+#ifdef __linux__
+#include <malloc.h>
+#endif
 
 #include "mt-kahypar/definitions.h"
 #include "mt-kahypar/io/command_line_options.h"
@@ -26,6 +33,8 @@ namespace fs = std::filesystem;
 #include "mt-kahypar/utils/exception.h"
 #include "mt-kahypar/utils/randomize.h"
 #include "mt-kahypar/utils/utilities.h"
+
+#include "mt-kahypar/utils/memory_tree.h"
 
 #include "mt-kahypar/datastructures/compressed_hypergraph.h"
 #include "mt-kahypar/datastructures/static_hypergraph.h"
@@ -121,21 +130,113 @@ static inline HyperedgeWeight compute_partition_quality_estimate(
     return 0;
 }
 
+// ---- Memory usage helpers (Linux) ----
+static inline size_t read_proc_status_kb(const char* key) {
+    std::ifstream in("/proc/self/status");
+    if (!in) return 0;
+    std::string line;
+    const std::string needle = std::string(key) + ":";
+    while (std::getline(in, line)) {
+        if (line.compare(0, needle.size(), needle) == 0) {
+            // Format: Key:\t<value> kB
+            size_t kb = 0;
+            for (size_t i = needle.size(); i < line.size(); ++i) {
+                if (line[i] >= '0' && line[i] <= '9') {
+                    kb = std::strtoull(line.c_str() + i, nullptr, 10);
+                    return kb;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+static inline size_t getCurrentRSSKB() { return read_proc_status_kb("VmRSS"); }
+static inline size_t getPeakRSSKB()    { return read_proc_status_kb("VmHWM"); }
+
+// Sampling-based per-phase peak RSS (more reliable than instantaneous diff)
+class PeakRssSampler {
+ public:
+    void start(unsigned interval_ms = 5, bool sample_now = true) {
+        _interval = interval_ms;
+        _max_kb.store(sample_now ? getCurrentRSSKB() : 0, std::memory_order_relaxed);
+        _running.store(true, std::memory_order_relaxed);
+        _thr = std::thread([this]() {
+            while (_running.load(std::memory_order_relaxed)) {
+                size_t rss = getCurrentRSSKB();
+                size_t prev = _max_kb.load(std::memory_order_relaxed);
+                if (rss > prev) _max_kb.store(rss, std::memory_order_relaxed);
+                std::this_thread::sleep_for(std::chrono::milliseconds(_interval));
+            }
+        });
+    }
+    size_t stop_and_get_peak() {
+        _running.store(false, std::memory_order_relaxed);
+        if (_thr.joinable()) _thr.join();
+        // Ensure the final RSS is accounted for even if sampling missed it
+        const size_t final_rss = getCurrentRSSKB();
+        size_t peak = _max_kb.load(std::memory_order_relaxed);
+        if (final_rss > peak) peak = final_rss;
+        return peak;
+    }
+ private:
+    std::atomic<bool> _running{false};
+    std::atomic<size_t> _max_kb{0};
+    std::thread _thr;
+    unsigned _interval{5};
+};
+
+// Read an unsigned integer from environment; returns std::nullopt if unset or invalid
+static inline std::optional<unsigned> read_env_uint(const char* name) {
+    const char* v = std::getenv(name);
+    if (!v || *v == '\0') return std::nullopt;
+    char* end = nullptr;
+    unsigned long val = std::strtoul(v, &end, 10);
+    if (end == v || *end != '\0') return std::nullopt;
+    if (val > std::numeric_limits<unsigned>::max()) return std::nullopt;
+    return static_cast<unsigned>(val);
+}
+
+static inline unsigned sampler_interval_ms_from_env() {
+    // MTK_MEM_SAMPLE_MS controls sampling interval; default 5ms; clamp to [1,1000]
+    unsigned interval = 5;
+    if (auto v = read_env_uint("MTK_MEM_SAMPLE_MS")) {
+        interval = std::max(1u, std::min(1000u, *v));
+    }
+    return interval;
+}
+
+static inline bool csv_has_header(const std::string& csv_path) {
+    std::ifstream in(csv_path);
+    if (!in) return false;
+    std::string first;
+    if (!std::getline(in, first)) return false;
+    return first.rfind("FileName,NodeCount,HyperedgeCount,IOTimeMS,PartitionTimeMS,", 0) == 0;
+}
+
 void write_csv_header(const std::string& csv_path) {
-    std::ofstream outfile(csv_path, std::ios::trunc);  // Overwrite if exists
+    if (csv_has_header(csv_path)) return; // Keep existing
+    std::ofstream outfile(csv_path, std::ios::app);
     outfile << "FileName,NodeCount,HyperedgeCount,IOTimeMS,PartitionTimeMS,"
+               "IOPeakRSSKB,PartitionPeakRSSKB,IOAbsPeakRSSKB,PartitionAbsPeakRSSKB,"
                "MemoryUsage,PartitionQuality,Compressed"
             << std::endl;
 }
 
 void append_csv_line(const std::string& csv_path, const std::string& filename,
                      size_t num_nodes, size_t num_hyperedges, size_t io_time,
-                     size_t partition_time, size_t memory_usage,
+                     size_t partition_time,
+                     size_t io_peak_kb, size_t part_peak_kb,
+                     size_t io_abs_peak_kb, size_t part_abs_peak_kb,
+                     size_t memory_usage,
                      HyperedgeWeight partition_quality,
                      bool compressed) {
     std::ofstream outfile(csv_path, std::ios::app);
     outfile << filename << "," << num_nodes << "," << num_hyperedges << ","
-            << io_time << "," << partition_time << "," << memory_usage << ","
+            << io_time << "," << partition_time << ","
+            << io_peak_kb << "," << part_peak_kb << ","
+            << io_abs_peak_kb << "," << part_abs_peak_kb << ","
+            << memory_usage << ","
             << partition_quality << ","
             << (compressed ? "1" : "0") << std::endl;
 }
@@ -196,6 +297,9 @@ void partition_graph(const std::string& filename, const Context& base_context,
     // Read Hypergraph
     utils::Timer& timer =
         utils::Utilities::instance().getTimer(context.utility_id);
+    // Memory baseline and sampler before I/O
+    const size_t io_start_rss_kb = getCurrentRSSKB();
+    PeakRssSampler io_sampler; io_sampler.start(sampler_interval_ms_from_env());
     timer.start_timer("io_hypergraph", "I/O Hypergraph");
 
     mt_kahypar_hypergraph_t hypergraph = io::readInputFile(
@@ -204,6 +308,11 @@ void partition_graph(const std::string& filename, const Context& base_context,
         context.preprocessing.stable_construction_of_incident_edges);
 
     timer.stop_timer("io_hypergraph");
+    // Memory after I/O (sampling-based peak within the phase)
+    const size_t io_abs_peak_kb = io_sampler.stop_and_get_peak();
+    const size_t io_end_rss_kb = getCurrentRSSKB();
+    const size_t io_rss_growth = (io_end_rss_kb >= io_start_rss_kb) ? (io_end_rss_kb - io_start_rss_kb) : 0;
+    size_t io_peak_kb = (io_abs_peak_kb > io_start_rss_kb) ? (io_abs_peak_kb - io_start_rss_kb) : io_rss_growth;
 		HighResClockTimepoint end = std::chrono::high_resolution_clock::now();
 		size_t io_time = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 
@@ -236,9 +345,13 @@ void partition_graph(const std::string& filename, const Context& base_context,
 
     // Partition Hypergraph
     start = std::chrono::high_resolution_clock::now();
+    const size_t part_start_rss_kb = getCurrentRSSKB();
+    PeakRssSampler part_sampler; part_sampler.start(sampler_interval_ms_from_env());
     mt_kahypar_partitioned_hypergraph_t partitioned_hypergraph =
         PartitionerFacade::partition(hypergraph, context, target_graph.get());
     end = std::chrono::high_resolution_clock::now();
+    const size_t part_abs_peak_kb = part_sampler.stop_and_get_peak();
+    const size_t part_end_rss_kb = getCurrentRSSKB();
 
 		size_t partition_time = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
     // Compute a simple partition quality estimate (no dependency on metrics.h)
@@ -263,23 +376,68 @@ void partition_graph(const std::string& filename, const Context& base_context,
         PartitionerFacade::writePartitionFile(
             partitioned_hypergraph, context.partition.graph_partition_filename);
     }
+    // Optional one-shot memory tree dump per variant, controlled by env var MTK_MEMTREE_ONCE
+    auto env_memtree = std::getenv("MTK_MEMTREE_ONCE");
+
     if (compressed) {
         const ds::CompressedHypergraph& hg =
             utils::cast<ds::CompressedHypergraph>(hypergraph);
-        append_csv_line(OUTPUT_PATH, filename, hg.initialNumNodes(),
-                        hg.initialNumEdges(), io_time, partition_time, hg.memoryConsumptionKB(),
+        if (env_memtree && *env_memtree != '\0') {
+            static bool dumped_compressed_once = false;
+            if (!dumped_compressed_once) {
+                utils::MemoryTreeNode root("CompressedHypergraph");
+                hg.memoryConsumption(&root);
+                root.finalize();
+                std::ofstream mt_file("./__out/memory_tree_compressed.txt", std::ios::out | std::ios::trunc);
+                if (mt_file) { mt_file << root; }
+                dumped_compressed_once = true;
+            }
+        }
+                append_csv_line(OUTPUT_PATH, filename, hg.initialNumNodes(),
+                                                hg.initialNumEdges(), io_time, partition_time,
+                                                                        io_peak_kb,
+                                                                        (part_abs_peak_kb > part_start_rss_kb ? (part_abs_peak_kb - part_start_rss_kb) :
+                                                                            (part_end_rss_kb >= part_start_rss_kb ? part_end_rss_kb - part_start_rss_kb : 0UL)
+                                                                        ),
+                                                                        io_abs_peak_kb,
+                                                                        part_abs_peak_kb,
+                                                hg.memoryConsumptionKB(),
                         partition_quality_estimate,
                         compressed);
     } else {
         const ds::StaticHypergraph& hg =
             utils::cast<ds::StaticHypergraph>(hypergraph);
-        append_csv_line(OUTPUT_PATH, filename, hg.initialNumNodes(),
-                        hg.initialNumEdges(), io_time, partition_time, hg.memoryConsumptionKB(),
+        if (env_memtree && *env_memtree != '\0') {
+            static bool dumped_static_once = false;
+            if (!dumped_static_once) {
+                utils::MemoryTreeNode root("StaticHypergraph");
+                hg.memoryConsumption(&root);
+                root.finalize();
+                std::ofstream mt_file("./__out/memory_tree_static.txt", std::ios::out | std::ios::trunc);
+                if (mt_file) { mt_file << root; }
+                dumped_static_once = true;
+            }
+        }
+                append_csv_line(OUTPUT_PATH, filename, hg.initialNumNodes(),
+                                                hg.initialNumEdges(), io_time, partition_time,
+                                                                        io_peak_kb,
+                                                                        (part_abs_peak_kb > part_start_rss_kb ? (part_abs_peak_kb - part_start_rss_kb) :
+                                                                            (part_end_rss_kb >= part_start_rss_kb ? part_end_rss_kb - part_start_rss_kb : 0UL)
+                                                                        ),
+                                                                        io_abs_peak_kb,
+                                                                        part_abs_peak_kb,
+                                                hg.memoryConsumptionKB(),
                         partition_quality_estimate,
                         compressed);
     }
 
-    parallel::MemoryPool::instance().free_memory_chunks();
+        parallel::MemoryPool::instance().free_memory_chunks();
+        // Optionally ask glibc to return freed memory to the OS to avoid baseline inflation across files
+        if (const char* trim = std::getenv("MTK_MALLOC_TRIM"); trim && *trim == '1') {
+            #ifdef __linux__
+            malloc_trim(0);
+            #endif
+        }
     TBBInitializer::instance().terminate();
 
     utils::delete_hypergraph(hypergraph);
@@ -314,6 +472,14 @@ int main(int argc, char* argv[]) {
 
     write_csv_header(OUTPUT_PATH);
 
+    // Child mode: run a single file (used for isolation via environment variables)
+    if (const char* single = std::getenv("MTK_SINGLE_FILE")) {
+        const char* c = std::getenv("MTK_COMPRESSED");
+        const bool compressed = (c && *c == '1');
+        partition_graph(single, base, OUTPUT_PATH, compressed);
+        return 0;
+    }
+
     const std::string directory = "./_graphs/benchmark_set_d";
 
     // Collect all regular files first
@@ -329,18 +495,70 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::cout << std::endl << "Partitioning Uncompressed Graphs" << std::endl;
+    // Isolation mode: spawn a fresh process per file and variant to avoid baseline carry-over
+    const bool isolate = [](){ if (const char* v = std::getenv("MTK_ISOLATE")) return *v == '1'; return false; }();
+    if (isolate) {
+        // Reconstruct base command (program + original args)
+        std::string base_cmd;
+        {
+            // Quote arguments to be safe for spaces
+            auto q = [](const std::string& s){
+                std::string r;
+                r.reserve(s.size() + 2);
+                r.push_back('\'');
+                for (char ch : s) {
+                    if (ch == '\'') { r += "'\\''"; }
+                    else { r.push_back(ch); }
+                }
+                r.push_back('\'');
+                return r;
+            };
+            base_cmd = q(argv[0]);
+            for (int i = 1; i < argc; ++i) {
+                base_cmd += " ";
+                base_cmd += q(argv[i]);
+            }
+        }
+
+        size_t count = 0;
+        std::cout << std::endl << "Partitioning Uncompressed Graphs (isolated)" << std::endl;
+        print_progress(count, total);
+        for (const auto& path : files) {
+            std::string cmd = std::string("MTK_SINGLE_FILE=") + path.string() +
+                              " MTK_COMPRESSED=0 MTK_MALLOC_TRIM=1 " + base_cmd + " > /dev/null";
+            int rc = std::system(cmd.c_str());
+            (void)rc;
+            print_progress(++count, total);
+        }
+        std::cout << std::endl << std::endl <<  "Partitioning Compressed Graphs (isolated)" << std::endl;
+        count = 0;
+        print_progress(count, total);
+        for (const auto& path : files) {
+            std::string cmd = std::string("MTK_SINGLE_FILE=") + path.string() +
+                              " MTK_COMPRESSED=1 MTK_MALLOC_TRIM=1 " + base_cmd + " > /dev/null";
+            int rc = std::system(cmd.c_str());
+            (void)rc;
+            print_progress(++count, total);
+        }
+        std::cout << std::endl << "Processing complete." << std::endl;
+        return 0;
+    }
+
     size_t count = 0;
+
+
+        std::cout << std::endl << std::endl <<  "Partitioning Compressed Graphs" << std::endl;
+        print_progress(count, total);
+        for (const auto& path : files) {
+            partition_graph(path.string(), base, OUTPUT_PATH, true);
+            print_progress(++count, total);
+        }
+        
+        count = 0;
+    std::cout << std::endl << "Partitioning Uncompressed Graphs" << std::endl;
     print_progress(count, total);
     for (const auto& path : files) {
         partition_graph(path.string(), base, OUTPUT_PATH);
-        print_progress(++count, total);
-    }
-    std::cout << std::endl << std::endl <<  "Partitioning Compressed Graphs" << std::endl;
-    count = 0;
-    print_progress(count, total);
-    for (const auto& path : files) {
-        partition_graph(path.string(), base, OUTPUT_PATH, true);
         print_progress(++count, total);
     }
 
