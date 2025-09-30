@@ -34,6 +34,7 @@
 
 #include <tbb/parallel_reduce.h>
 #include <tbb/parallel_sort.h>
+#include <tbb/enumerable_thread_specific.h>
 
 #include <unordered_map>
 #include <algorithm>
@@ -79,7 +80,7 @@ namespace mt_kahypar::ds {
    *
    * \param communities Community structure that should be contracted
    */
-  CompressedHypergraph CompressedHypergraph::contract(parallel::scalable_vector<HypernodeID>& communities, bool deterministic) {
+  CompressedHypergraph CompressedHypergraph::contract(parallel::scalable_vector<HypernodeID>& communities, bool /* deterministic */) {
     // Stage 0: Preconditions and helpers
     ASSERT(communities.size() == _num_hypernodes);
 
@@ -171,35 +172,60 @@ namespace mt_kahypar::ds {
       return h;
     };
 
-    std::vector<HyperedgeID> cand; cand.reserve(static_cast<size_t>(_num_hyperedges));
-    std::vector<uint64_t> chash; chash.reserve(static_cast<size_t>(_num_hyperedges));
-    std::vector<uint32_t> csize; csize.reserve(static_cast<size_t>(_num_hyperedges));
-
-    std::vector<HypernodeID> tmp; tmp.reserve(32);
-    for (HyperedgeID he = 0; he < _num_hyperedges; ++he) {
-      if (!edgeIsEnabled(he)) continue;
-      build_coarse_pins(he, tmp);
-      if (tmp.size() <= 1) continue;
-      cand.push_back(he);
-      chash.push_back(hash_pins(tmp));
-      csize.push_back(static_cast<uint32_t>(tmp.size()));
-    }
+    // Build candidate list and metadata in parallel with thread-local buffers
+    struct LocalMeta {
+      std::vector<HyperedgeID> cand;
+      std::vector<uint64_t> chash;
+      std::vector<uint32_t> csize;
+      std::vector<uint32_t> cfp;
+    };
+    tbb::enumerable_thread_specific<LocalMeta> locals;
+    tbb::enumerable_thread_specific<std::vector<HypernodeID>> tls_pins;
+    tbb::parallel_for(HyperedgeID(0), _num_hyperedges, [&](const HyperedgeID he) {
+      if (!edgeIsEnabled(he)) return;
+      auto& pins = tls_pins.local();
+      pins.clear();
+      pins.reserve(32);
+      build_coarse_pins(he, pins);
+      if (pins.size() <= 1) return;
+      auto& lm = locals.local();
+      lm.cand.push_back(he);
+      lm.chash.push_back(hash_pins(pins));
+      lm.csize.push_back(static_cast<uint32_t>(pins.size()));
+      // 32-bit FNV-1a fingerprint as a cheap lex locality key
+      uint32_t fp = 2166136261u;
+      for (HypernodeID v : pins) { fp ^= static_cast<uint32_t>(v); fp *= 16777619u; }
+      lm.cfp.push_back(fp);
+    });
+    // Merge locals deterministically by thread enumeration order
+    std::vector<HyperedgeID> cand;
+    std::vector<uint64_t> chash;
+    std::vector<uint32_t> csize;
+    std::vector<uint32_t> cfp;
+    size_t total = 0;
+    locals.combine_each([&](const LocalMeta& lm) { total += lm.cand.size(); });
+    cand.reserve(total); chash.reserve(total); csize.reserve(total); cfp.reserve(total);
+    locals.combine_each([&](LocalMeta& lm) {
+      cand.insert(cand.end(), lm.cand.begin(), lm.cand.end());
+      chash.insert(chash.end(), lm.chash.begin(), lm.chash.end());
+      csize.insert(csize.end(), lm.csize.begin(), lm.csize.end());
+      cfp.insert(cfp.end(), lm.cfp.begin(), lm.cfp.end());
+      // free local buffers
+      lm.cand.clear(); lm.chash.clear(); lm.csize.clear(); lm.cfp.clear();
+      lm.cand.shrink_to_fit(); lm.chash.shrink_to_fit(); lm.csize.shrink_to_fit(); lm.cfp.shrink_to_fit();
+    });
 
     std::vector<size_t> perm(cand.size());
     std::iota(perm.begin(), perm.end(), 0);
+    // Comparator avoids decoding; equality is resolved in the dedup pass
     auto cmp_coarse = [&](size_t ia, size_t ib) {
       const uint64_t ha = chash[ia], hb = chash[ib];
       if (ha != hb) return ha < hb;
       if (csize[ia] != csize[ib]) return csize[ia] < csize[ib];
-      const HyperedgeID a = cand[ia];
-      const HyperedgeID b = cand[ib];
-      std::vector<HypernodeID> va, vb;
-      build_coarse_pins(a, va);
-      build_coarse_pins(b, vb);
-      // sizes equal here
-      return std::lexicographical_compare(va.begin(), va.end(), vb.begin(), vb.end());
+      if (cfp[ia] != cfp[ib]) return cfp[ia] < cfp[ib];
+      return cand[ia] < cand[ib];
     };
-    std::stable_sort(perm.begin(), perm.end(), cmp_coarse);
+    tbb::parallel_sort(perm.begin(), perm.end(), cmp_coarse);
 
     // Build deduplicated representative list, weights, and encoded lengths
     std::vector<HyperedgeID> uniq_rep; uniq_rep.reserve(perm.size());
@@ -207,11 +233,14 @@ namespace mt_kahypar::ds {
     std::vector<uint32_t> uniq_len; uniq_len.reserve(perm.size());
     std::vector<uint32_t> uniq_pins; uniq_pins.reserve(perm.size());
 
-    size_t i = 0; std::vector<HypernodeID> a, b;
+    size_t i = 0; std::vector<HypernodeID> a, b, cached;
+    bool cached_valid = false; size_t cached_perm_index = 0;
     while (i < perm.size()) {
       const size_t idx = perm[i];
       const HyperedgeID rep = cand[idx];
-      build_coarse_pins(rep, a);
+      // Reuse cached pins if we already decoded them for the next representative
+      if (cached_valid && cached_perm_index == idx) { a.swap(cached); cached_valid = false; }
+      else { build_coarse_pins(rep, a); }
       const uint32_t pins_cnt = static_cast<uint32_t>(a.size());
       // Compute encoded length for representative
       size_t elen = varint_size_u64(pins_cnt);
@@ -223,8 +252,16 @@ namespace mt_kahypar::ds {
         const size_t idx2 = perm[j];
         if (chash[idx2] != chash[idx]) break;
         if (csize[idx2] != pins_cnt) break;
+        // Fast pre-filter: skip decoding on fingerprint mismatch
+        if (cfp[idx2] != cfp[idx]) { break; }
         build_coarse_pins(cand[idx2], b);
-        if (b != a) break;
+        if (b != a) {
+          // carry b to next representative to avoid re-decoding
+          cached.swap(b);
+          cached_perm_index = idx2;
+          cached_valid = true;
+          break;
+        }
         wsum += edgeWeight(cand[idx2]);
         ++j;
       }
@@ -261,8 +298,8 @@ namespace mt_kahypar::ds {
     hypergraph._hypernode_enabled.assign(num_coarse_nodes, 1);
     hypergraph._hyperedge_offsets.assign(hypergraph._num_hyperedges, 0);
     hypergraph._hyperedge_enabled.assign(hypergraph._num_hyperedges, 1);
-  hypergraph._compressed_incidence_array.clear();
-  if (total_inc_bytes > 0) hypergraph._compressed_incidence_array.reserve(total_inc_bytes);
+    hypergraph._compressed_incidence_array.clear();
+    if (total_inc_bytes > 0) hypergraph._compressed_incidence_array.reserve(total_inc_bytes);
     hypergraph._compressed_incident_nets.clear();
 
     // Set node weights
@@ -276,24 +313,39 @@ namespace mt_kahypar::ds {
     coarse_node_weight.shrink_to_fit();
 
     // Encode coarse edges (pins) directly into final buffer
+    // Pre-size incidence array and compute offsets by prefix sum of uniq_len
     size_t pins_bytes_offset = 0;
-    if (hypergraph._hyperedge_weights.empty()) hypergraph._hyperedge_weights.ensure_initialized(hypergraph._num_hyperedges);
+    if (total_inc_bytes > 0) hypergraph._compressed_incidence_array.resize(total_inc_bytes);
     for (HyperedgeID he = 0; he < hypergraph._num_hyperedges; ++he) {
       hypergraph._hyperedge_offsets[he] = pins_bytes_offset;
+      pins_bytes_offset += uniq_len[he];
+    }
+    if (hypergraph._hyperedge_weights.empty()) hypergraph._hyperedge_weights.ensure_initialized(hypergraph._num_hyperedges);
+    // Assign weights sequentially to avoid potential contention in TwoLevelVector
+    for (HyperedgeID he = 0; he < hypergraph._num_hyperedges; ++he) {
       hypergraph._hyperedge_weights[he] = uniq_weight[he];
-      // Write header and pins for representative
+    }
+    // Encode pins in parallel into pre-sized buffer
+    uint8_t* base_ptr = hypergraph._compressed_incidence_array.data();
+    tbb::parallel_for(HyperedgeID(0), hypergraph._num_hyperedges, [&](const HyperedgeID he) {
       std::vector<HypernodeID> pins;
+      pins.reserve(32);
       build_coarse_pins(uniq_rep[he], pins);
-      encode_varint(static_cast<uint64_t>(pins.size()), hypergraph._compressed_incidence_array);
+      uint8_t* ptr = base_ptr + hypergraph._hyperedge_offsets[he];
+      ptr += encode_varint_to_ptr(static_cast<uint64_t>(pins.size()), ptr);
       HypernodeID pprev = 0;
       for (HypernodeID v : pins) {
-        encode_varint(static_cast<uint64_t>(v - pprev), hypergraph._compressed_incidence_array);
+        ptr += encode_varint_to_ptr(static_cast<uint64_t>(v - pprev), ptr);
         pprev = v;
       }
-      pins_bytes_offset += uniq_len[he];
-      hypergraph._num_pins += static_cast<HypernodeID>(pins.size());
-      if (pins.size() > static_cast<size_t>(hypergraph._max_edge_size)) {
-        hypergraph._max_edge_size = static_cast<HypernodeID>(pins.size());
+    });
+    // Compute totals from metadata
+    hypergraph._num_pins = 0;
+    hypergraph._max_edge_size = 0;
+    for (HyperedgeID he = 0; he < hypergraph._num_hyperedges; ++he) {
+      hypergraph._num_pins += static_cast<HypernodeID>(uniq_pins[he]);
+      if (uniq_pins[he] > static_cast<uint32_t>(hypergraph._max_edge_size)) {
+        hypergraph._max_edge_size = static_cast<HypernodeID>(uniq_pins[he]);
       }
     }
 
