@@ -3,16 +3,12 @@
 #include <fstream>
 #include <memory>
 #include <string>
-#include <thread>
 #include <vector>
 namespace fs = std::filesystem;
 
 #include <iostream>
 #include <algorithm>
 #include <cstdlib>
-#include <atomic>
-#include <optional>
-#include <limits>
 #ifdef __linux__
 #include <malloc.h>
 #endif
@@ -154,57 +150,7 @@ static inline size_t read_proc_status_kb(const char* key) {
 static inline size_t getCurrentRSSKB() { return read_proc_status_kb("VmRSS"); }
 static inline size_t getPeakRSSKB()    { return read_proc_status_kb("VmHWM"); }
 
-// Sampling-based per-phase peak RSS (more reliable than instantaneous diff)
-class PeakRssSampler {
- public:
-    void start(unsigned interval_ms = 5, bool sample_now = true) {
-        _interval = interval_ms;
-        _max_kb.store(sample_now ? getCurrentRSSKB() : 0, std::memory_order_relaxed);
-        _running.store(true, std::memory_order_relaxed);
-        _thr = std::thread([this]() {
-            while (_running.load(std::memory_order_relaxed)) {
-                size_t rss = getCurrentRSSKB();
-                size_t prev = _max_kb.load(std::memory_order_relaxed);
-                if (rss > prev) _max_kb.store(rss, std::memory_order_relaxed);
-                std::this_thread::sleep_for(std::chrono::milliseconds(_interval));
-            }
-        });
-    }
-    size_t stop_and_get_peak() {
-        _running.store(false, std::memory_order_relaxed);
-        if (_thr.joinable()) _thr.join();
-        // Ensure the final RSS is accounted for even if sampling missed it
-        const size_t final_rss = getCurrentRSSKB();
-        size_t peak = _max_kb.load(std::memory_order_relaxed);
-        if (final_rss > peak) peak = final_rss;
-        return peak;
-    }
- private:
-    std::atomic<bool> _running{false};
-    std::atomic<size_t> _max_kb{0};
-    std::thread _thr;
-    unsigned _interval{5};
-};
-
-// Read an unsigned integer from environment; returns std::nullopt if unset or invalid
-static inline std::optional<unsigned> read_env_uint(const char* name) {
-    const char* v = std::getenv(name);
-    if (!v || *v == '\0') return std::nullopt;
-    char* end = nullptr;
-    unsigned long val = std::strtoul(v, &end, 10);
-    if (end == v || *end != '\0') return std::nullopt;
-    if (val > std::numeric_limits<unsigned>::max()) return std::nullopt;
-    return static_cast<unsigned>(val);
-}
-
-static inline unsigned sampler_interval_ms_from_env() {
-    // MTK_MEM_SAMPLE_MS controls sampling interval; default 5ms; clamp to [1,1000]
-    unsigned interval = 5;
-    if (auto v = read_env_uint("MTK_MEM_SAMPLE_MS")) {
-        interval = std::max(1u, std::min(1000u, *v));
-    }
-    return interval;
-}
+// No sampler needed: we use VmHWM (MaxRSS) checkpoints per phase and process isolation between files/variants.
 
 // Write a fresh header (truncate file). Call this once per full benchmark run (parent process).
 void write_csv_header(const std::string& csv_path) {
@@ -310,9 +256,8 @@ void partition_graph(const std::string& filename, const Context& base_context,
     // Read Hypergraph
     utils::Timer& timer =
         utils::Utilities::instance().getTimer(context.utility_id);
-    // Memory baseline and sampler before I/O
+    // Memory baseline before I/O
     const size_t io_start_rss_kb = getCurrentRSSKB();
-    PeakRssSampler io_sampler; io_sampler.start(sampler_interval_ms_from_env());
     timer.start_timer("io_hypergraph", "I/O Hypergraph");
 
     mt_kahypar_hypergraph_t hypergraph = io::readInputFile(
@@ -321,8 +266,8 @@ void partition_graph(const std::string& filename, const Context& base_context,
         context.preprocessing.stable_construction_of_incident_edges);
 
     timer.stop_timer("io_hypergraph");
-    // Memory after I/O (sampling-based peak within the phase)
-    const size_t io_abs_peak_kb = io_sampler.stop_and_get_peak();
+    // Memory after I/O: use MaxRSS (VmHWM) checkpoint
+    const size_t io_abs_peak_kb = getPeakRSSKB();
     const size_t io_end_rss_kb = getCurrentRSSKB();
     const size_t io_rss_growth = (io_end_rss_kb >= io_start_rss_kb) ? (io_end_rss_kb - io_start_rss_kb) : 0;
     size_t io_peak_kb = (io_abs_peak_kb > io_start_rss_kb) ? (io_abs_peak_kb - io_start_rss_kb) : io_rss_growth;
@@ -359,11 +304,10 @@ void partition_graph(const std::string& filename, const Context& base_context,
     // Partition Hypergraph
     start = std::chrono::high_resolution_clock::now();
     const size_t part_start_rss_kb = getCurrentRSSKB();
-    PeakRssSampler part_sampler; part_sampler.start(sampler_interval_ms_from_env());
     mt_kahypar_partitioned_hypergraph_t partitioned_hypergraph =
         PartitionerFacade::partition(hypergraph, context, target_graph.get());
     end = std::chrono::high_resolution_clock::now();
-    const size_t part_abs_peak_kb = part_sampler.stop_and_get_peak();
+    const size_t part_abs_peak_kb = getPeakRSSKB();
     const size_t part_end_rss_kb = getCurrentRSSKB();
 
 		size_t partition_time = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
@@ -510,9 +454,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Isolation mode: spawn a fresh process per file and variant to avoid baseline carry-over
-    const bool isolate = [](){ if (const char* v = std::getenv("MTK_ISOLATE")) return *v == '1'; return false; }();
-    if (isolate) {
+    // Always run isolated: spawn a fresh process per file and variant to avoid carry-over
+    {
         // Reconstruct base command (program + original args)
         std::string base_cmd;
         {
@@ -558,25 +501,4 @@ int main(int argc, char* argv[]) {
         std::cout << std::endl << "Processing complete." << std::endl;
         return 0;
     }
-
-    size_t count = 0;
-
-
-        std::cout << std::endl << std::endl <<  "Partitioning Compressed Graphs" << std::endl;
-        print_progress(count, total);
-        for (const auto& path : files) {
-            partition_graph(path.string(), base, OUTPUT_PATH, true);
-            print_progress(++count, total);
-        }
-        
-        count = 0;
-    std::cout << std::endl << "Partitioning Uncompressed Graphs" << std::endl;
-    print_progress(count, total);
-    for (const auto& path : files) {
-        partition_graph(path.string(), base, OUTPUT_PATH);
-        print_progress(++count, total);
-    }
-
-    std::cout << std::endl << "Processing complete." << std::endl;
-    return 0;
 }
